@@ -3,6 +3,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from utils.db import init_engine_and_session, run_migrations
+from wx_store import WxStore
 
 intents = discord.Intents.default()
 intents.message_content = True
