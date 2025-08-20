@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, datetime as dt
 from typing import Optional
-from sqlalchemy import create_engine, Integer, String, DateTime, ForeignKey, Float, Text, Boolean
+from sqlalchemy import create_engine, Integer, String, DateTime, ForeignKey, Float, Text, Boolean, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 class Base(DeclarativeBase):
@@ -55,7 +55,7 @@ class Reminder(Base):
     delivered: Mapped[bool] = mapped_column(Boolean, default=False)
 
 class Note(Base):
-    __tablename__ = "notes"
+    __tablename__ = "notes"  # your long-form notes table — keep as-is
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
@@ -68,7 +68,39 @@ def init_engine_and_session(db_path: str):
     return engine, SessionLocal
 
 def run_migrations(engine):
+    # Create ORM-declared tables
     Base.metadata.create_all(engine)
+
+    # Create weather + KV tables that are used by the weather cog (raw SQL)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS weather_zips (
+            user_id INTEGER PRIMARY KEY,
+            zip TEXT NOT NULL
+        );
+        """)
+        conn.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS weather_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            zip TEXT NOT NULL,
+            cadence TEXT NOT NULL CHECK (cadence IN ('daily','weekly')),
+            hh INTEGER NOT NULL,
+            mi INTEGER NOT NULL,
+            weekly_days INTEGER NOT NULL DEFAULT 7,
+            next_run_utc TEXT NOT NULL
+        );
+        """)
+        conn.exec_driver_sql("""
+        -- key/value store for small user settings (used by weather alerts)
+        CREATE TABLE IF NOT EXISTS user_notes_kv (
+            user_id INTEGER NOT NULL,
+            k TEXT NOT NULL,
+            v TEXT NOT NULL,
+            PRIMARY KEY (user_id, k)
+        );
+        """)
+
     # Seed some default shop items & businesses if empty
     from sqlalchemy.orm import Session
     with Session(engine) as s:
