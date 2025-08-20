@@ -2,7 +2,8 @@
 from __future__ import annotations
 import asyncio
 import datetime as dt
-from typing import Optional, Dict
+import re
+from typing import Optional, Dict, List, Tuple
 
 import discord
 from discord.ext import commands
@@ -10,281 +11,388 @@ from discord import app_commands
 from sqlalchemy import text
 
 MIN_SECONDS = 1
-MAX_SECONDS = 7 * 24 * 3600  # 7 days cap as a sanity guard
+MAX_SECONDS = 7 * 24 * 3600  # 7 days
 
-# ------------- DB helpers -------------
-
+# ---------- SQL (auto-migrates missing columns) ----------
 CREATE_RULES_SQL = """
 CREATE TABLE IF NOT EXISTS autodelete_rules (
   channel_id INTEGER PRIMARY KEY,
   seconds INTEGER NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  users_mode TEXT NOT NULL DEFAULT 'all',            -- 'all' | 'only' | 'except'
+  users_csv  TEXT NOT NULL DEFAULT '',               -- comma-separated user IDs
   updated_at TEXT NOT NULL
 );
 """
+ALTER_ADD_USERS_MODE = "ALTER TABLE autodelete_rules ADD COLUMN users_mode TEXT NOT NULL DEFAULT 'all';"
+ALTER_ADD_USERS_CSV  = "ALTER TABLE autodelete_rules ADD COLUMN users_csv  TEXT NOT NULL DEFAULT '';"
 
-SELECT_RULE_SQL = "SELECT seconds, enabled FROM autodelete_rules WHERE channel_id=:cid"
-UPSERT_RULE_SQL = """
-INSERT INTO autodelete_rules(channel_id, seconds, enabled, updated_at)
-VALUES (:cid, :sec, :en, :ts)
-ON CONFLICT(channel_id) DO UPDATE SET
-  seconds=excluded.seconds,
-  enabled=excluded.enabled,
-  updated_at=excluded.updated_at
-"""
-DELETE_RULE_SQL = "DELETE FROM autodelete_rules WHERE channel_id=:cid"
+# ---------- utils ----------
+DUR_RE = re.compile(r"(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s?)?\s*$", re.I)
 
-# ------------- UI -------------
+def parse_duration(s: str) -> Optional[int]:
+    s = s.strip().lower()
+    if s.isdigit():
+        sec = int(s)
+        return max(MIN_SECONDS, min(MAX_SECONDS, sec))
+    m = DUR_RE.match(s)
+    if not m:
+        return None
+    h = int(m.group(1) or 0)
+    mm = int(m.group(2) or 0)
+    ss = int(m.group(3) or 0)
+    sec = h * 3600 + mm * 60 + ss
+    if sec <= 0:
+        return None
+    return max(MIN_SECONDS, min(MAX_SECONDS, sec))
 
-class SecondsModal(discord.ui.Modal, title="Set Auto-Delete Delay"):
+def pretty_duration(sec: int) -> str:
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s or not parts: parts.append(f"{s}s")
+    return "".join(parts)
+
+def parse_user_list(input_text: str) -> List[int]:
+    ids: List[int] = []
+    # accept mentions like <@123>, <@!123>, raw IDs, or @username (ignored)
+    for token in re.split(r"[,\s]+", input_text.strip()):
+        if not token:
+            continue
+        m = re.match(r"<@!?(?P<i>\d+)>", token)
+        if m:
+            ids.append(int(m.group("i")))
+            continue
+        if token.isdigit():
+            ids.append(int(token))
+    # dedupe
+    return list(dict.fromkeys(ids))
+
+# ---------- UI Modals ----------
+class SecondsModal(discord.ui.Modal, title="Set Auto-Delete Duration"):
     def __init__(self, view: "AutoDeleteView"):
         super().__init__(timeout=180)
         self.view_ref = view
-        self.seconds = discord.ui.TextInput(
-            label=f"Delay in seconds ({MIN_SECONDS}–{MAX_SECONDS})",
-            placeholder="e.g. 45",
-            max_length=10,
+        self.input = discord.ui.TextInput(
+            label=f"Duration (e.g. 10s, 20m, 1h, 1h20m10s)",
+            placeholder="e.g. 45s",
+            max_length=20,
             required=True,
         )
-        self.add_item(self.seconds)
+        self.add_item(self.input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Parse & clamp
-        try:
-            sec = int(str(self.seconds.value).strip())
-        except ValueError:
-            return await interaction.response.send_message("Not a number.", ephemeral=True)
-        sec = max(MIN_SECONDS, min(MAX_SECONDS, sec))
+        sec = parse_duration(str(self.input.value))
+        if sec is None:
+            return await interaction.response.send_message("❌ Invalid duration.", ephemeral=True)
 
         ch = self.view_ref.channel
         cog: AutoDeleteCog = self.view_ref.cog
-        await cog._set_rule(ch.id, sec, True)
-
-        # Defer to avoid “Unknown Webhook” then edit original message
+        await cog._set_rule(ch.id, seconds=sec, enabled=True)
+        # modal path: defer and edit via followup
         await interaction.response.defer(ephemeral=True)
         await self.view_ref.refresh(interaction)
-        await interaction.followup.send(f"✅ Delay set to **{sec}s** for {ch.mention}.", ephemeral=True)
+        await interaction.followup.send(f"✅ Duration set to **{pretty_duration(sec)}** for {ch.mention}.", ephemeral=True)
 
+class UsersFilterModal(discord.ui.Modal, title="User Filter"):
+    def __init__(self, view: "AutoDeleteView", mode: str, users_csv: str):
+        super().__init__(timeout=180)
+        self.view_ref = view
+        self.mode_in = discord.ui.TextInput(
+            label="Mode ('all', 'only', 'except')",
+            default=mode,
+            max_length=10,
+            required=True,
+        )
+        self.users_in = discord.ui.TextInput(
+            label="Users (IDs or @mentions, comma/space separated)",
+            default=users_csv,
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+            required=False,
+        )
+        self.add_item(self.mode_in)
+        self.add_item(self.users_in)
 
+    async def on_submit(self, interaction: discord.Interaction):
+        mode = str(self.mode_in.value).strip().lower()
+        if mode not in ("all", "only", "except"):
+            return await interaction.response.send_message("❌ Mode must be 'all', 'only', or 'except'.", ephemeral=True)
+
+        ids = parse_user_list(str(self.users_in.value))
+        users_csv = ",".join(str(i) for i in ids)
+        await self.view_ref.cog._set_filter(self.view_ref.channel.id, mode=mode, users_csv=users_csv)
+
+        await interaction.response.defer(ephemeral=True)
+        await self.view_ref.refresh(interaction)
+        nice = "(none)" if not ids else ", ".join(f"<@{i}>" for i in ids)
+        await interaction.followup.send(f"✅ Filter set to **{mode}** for {self.view_ref.channel.mention}: {nice}", ephemeral=True)
+
+# ---------- View ----------
 class AutoDeleteView(discord.ui.View):
-    def __init__(self, cog: "AutoDeleteCog", channel: discord.abc.GuildChannel):
+    def __init__(self, cog: "AutoDeleteCog", channel: discord.TextChannel):
         super().__init__(timeout=180)
         self.cog = cog
         self.channel = channel
-        self.message_id: Optional[int] = None  # original ephemeral message id
+        self.message_id: Optional[int] = None  # ephemeral message id for modal edits
 
     async def refresh(self, interaction: discord.Interaction):
         rule = await self.cog._get_rule(self.channel.id)
-        status = "Enabled" if (rule and rule["enabled"]) else "Disabled"
-        sec = rule["seconds"] if rule else None
-        desc = (
-            f"**Status:** {status}\n"
-            + (f"**Delay:** {sec}s\n" if sec is not None else "")
-            + "Use the buttons below to configure this channel."
-        )
+        enabled = bool(rule and rule["enabled"])
+        seconds = int(rule["seconds"]) if rule else None
+        mode = (rule or {}).get("users_mode", "all")
+        users_csv = (rule or {}).get("users_csv", "")
+        users = [int(x) for x in users_csv.split(",") if x.strip().isdigit()]
+
+        desc = []
+        desc.append(f"**Status:** {'Enabled' if enabled else 'Disabled'}")
+        if seconds is not None:
+            desc.append(f"**Duration:** {pretty_duration(seconds)}")
+        desc.append(f"**User filter:** `{mode}` " +
+                    ("" if mode == "all" else (", ".join(f"<@{i}>" for i in users) or "(none)")))
+        desc.append("\nUse buttons below to configure this channel.")
         embed = discord.Embed(
             title=f"🧹 Auto-Delete — #{self.channel.name}",
-            description=desc,
+            description="\n".join(desc),
             color=discord.Color.blurple(),
         )
 
-        # Enable/disable buttons based on rule state
-        self.enable_button.disabled = bool(rule and rule["enabled"])
-        self.disable_button.disabled = not bool(rule and rule["enabled"])
-
-        # For modals (no attached message), edit via followup+stored id
-        if getattr(interaction, "message", None) is None:
-            if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True)
-            if self.message_id:
-                await interaction.followup.edit_message(self.message_id, embed=embed, view=self)
-            return
+        self.enable_button.disabled = enabled
+        self.disable_button.disabled = not enabled
 
         # Component interactions can directly edit
-        await interaction.response.edit_message(embed=embed, view=self)
+        if getattr(interaction, "message", None) is not None and not interaction.response.is_done():
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        # Modal path: defer and edit via followup
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        if self.message_id:
+            await interaction.followup.edit_message(self.message_id, embed=embed, view=self)
 
     @discord.ui.button(label="Enable", style=discord.ButtonStyle.success)
     async def enable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         rule = await self.cog._get_rule(self.channel.id)
-        sec = rule["seconds"] if rule else 60
+        sec = int(rule["seconds"]) if rule else 60
         await self.cog._set_rule(self.channel.id, sec, True)
         await self.refresh(interaction)
 
     @discord.ui.button(label="Disable", style=discord.ButtonStyle.danger)
     async def disable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog._set_rule(self.channel.id, (await self.cog._get_rule(self.channel.id) or {"seconds": 60})["seconds"], False)
+        rule = await self.cog._get_rule(self.channel.id) or {"seconds": 60}
+        await self.cog._set_rule(self.channel.id, int(rule["seconds"]), False)
         await self.refresh(interaction)
 
-    @discord.ui.button(label="Set Seconds", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Set Duration", style=discord.ButtonStyle.primary)
     async def set_seconds(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SecondsModal(self))
 
+    @discord.ui.button(label="User Filter", style=discord.ButtonStyle.secondary)
+    async def set_filter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rule = await self.cog._get_rule(self.channel.id) or {"users_mode": "all", "users_csv": ""}
+        await interaction.response.send_modal(UsersFilterModal(self, rule["users_mode"], rule["users_csv"]))
+
     @discord.ui.button(label="Backfill Recent (100)", style=discord.ButtonStyle.secondary)
     async def backfill(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Schedule timers for the last ~100 messages younger than the rule
         rule = await self.cog._get_rule(self.channel.id)
         if not rule or not rule["enabled"]:
             return await interaction.response.send_message("Enable the rule first.", ephemeral=True)
-        sec = int(rule["seconds"])
-        # Fetch history without blocking the UI too long
         await interaction.response.defer(ephemeral=True)
-        scheduled = await self.cog._backfill_recent(self.channel, sec, limit=100)
-        await interaction.followup.send(f"⏱️ Scheduled {scheduled} messages for deletion.", ephemeral=True)
+        scheduled = await self.cog._backfill_recent(
+            self.channel,
+            seconds=int(rule["seconds"]),
+            users_mode=rule.get("users_mode", "all"),
+            users=rule.get("users_csv", ""),
+            limit=100,
+        )
+        await interaction.followup.send(f"⏱️ Scheduled/deleted **{scheduled}** messages.", ephemeral=True)
 
-# ------------- Cog -------------
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.refresh(interaction)
 
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary)
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+# ---------- Cog ----------
 class AutoDeleteCog(commands.Cog):
-    """
-    Per-channel auto-delete with per-message timers (supports <60s).
-    Also includes /purge.
-    """
+    """Per-channel auto-delete with per-message timers + user filters + purge."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._rule_cache: Dict[int, Dict[str, int]] = {}  # channel_id -> {"seconds": int, "enabled": 0/1}
-        self._tasks: Dict[int, asyncio.Task] = {}  # message_id -> task
-        # Ensure table exists
+        self._rule_cache: Dict[int, Dict[str, str | int]] = {}  # channel_id -> rule dict
+        self._tasks: Dict[int, asyncio.Task] = {}               # message_id -> task
+
         with self.bot.engine.begin() as c:
             c.execute(text(CREATE_RULES_SQL))
+            # migrate columns if missing
+            try: c.execute(text(ALTER_ADD_USERS_MODE))
+            except Exception: pass
+            try: c.execute(text(ALTER_ADD_USERS_CSV))
+            except Exception: pass
 
-    # ---------- DB I/O ----------
-
-    async def _get_rule(self, channel_id: int) -> Optional[Dict[str, int]]:
+    # ----- DB I/O -----
+    async def _get_rule(self, channel_id: int) -> Optional[Dict[str, str | int]]:
         if channel_id in self._rule_cache:
             return self._rule_cache[channel_id]
         with self.bot.engine.connect() as c:
-            row = c.execute(text(SELECT_RULE_SQL), {"cid": channel_id}).fetchone()
+            row = c.execute(text(
+                "SELECT seconds, enabled, users_mode, users_csv FROM autodelete_rules WHERE channel_id=:cid"
+            ), {"cid": channel_id}).fetchone()
         if not row:
             return None
-        data = {"seconds": int(row[0]), "enabled": int(row[1])}
-        self._rule_cache[channel_id] = data
-        return data
+        rule = {"seconds": int(row[0]), "enabled": int(row[1]), "users_mode": row[2], "users_csv": row[3]}
+        self._rule_cache[channel_id] = rule
+        return rule
 
     async def _set_rule(self, channel_id: int, seconds: int, enabled: bool):
         seconds = max(MIN_SECONDS, min(MAX_SECONDS, int(seconds)))
         with self.bot.engine.begin() as c:
-            c.execute(text(UPSERT_RULE_SQL), {"cid": channel_id, "sec": seconds, "en": 1 if enabled else 0, "ts": dt.datetime.utcnow().isoformat()})
-        self._rule_cache[channel_id] = {"seconds": seconds, "enabled": 1 if enabled else 0}
+            c.execute(text(
+                "INSERT INTO autodelete_rules(channel_id, seconds, enabled, updated_at) "
+                "VALUES (:cid,:sec,:en,:ts) "
+                "ON CONFLICT(channel_id) DO UPDATE SET seconds=excluded.seconds, enabled=excluded.enabled, updated_at=excluded.updated_at"
+            ), {"cid": channel_id, "sec": seconds, "en": 1 if enabled else 0, "ts": dt.datetime.utcnow().isoformat()})
+        rule = await self._get_rule(channel_id) or {}
+        rule.update({"seconds": seconds, "enabled": 1 if enabled else 0})
+        self._rule_cache[channel_id] = rule
 
-    # ---------- Real-time deletion ----------
+    async def _set_filter(self, channel_id: int, *, mode: str, users_csv: str):
+        with self.bot.engine.begin() as c:
+            c.execute(text(
+                "UPDATE autodelete_rules SET users_mode=:m, users_csv=:u, updated_at=:ts WHERE channel_id=:cid"
+            ), {"m": mode, "u": users_csv, "cid": channel_id, "ts": dt.datetime.utcnow().isoformat()})
+        rule = await self._get_rule(channel_id) or {}
+        rule.update({"users_mode": mode, "users_csv": users_csv})
+        self._rule_cache[channel_id] = rule
 
-    async def _schedule_delete(self, message: discord.Message, seconds: int):
-        """
-        Schedule a delete for a specific message with the given delay.
-        Will check the rule again right before deleting in case it changed.
-        """
+    # ----- Filter check -----
+    def _passes_user_filter(self, author_id: int, mode: str, users_csv: str) -> bool:
+        if mode == "all":
+            return True
+        ids = [int(x) for x in users_csv.split(",") if x.strip().isdigit()]
+        if mode == "only":
+            return author_id in ids
+        if mode == "except":
+            return author_id not in ids
+        return True
+
+    # ----- Scheduling -----
+    async def _schedule_delete(self, message: discord.Message, seconds: int, *, users_mode="all", users_csv=""):
         if message.id in self._tasks:
-            # already scheduled (shouldn't really happen)
-            try:
-                self._tasks[message.id].cancel()
-            except Exception:
-                pass
+            try: self._tasks[message.id].cancel()
+            except Exception: pass
 
         async def runner():
             try:
+                # initial wait
                 now = dt.datetime.utcnow()
                 age = (now - message.created_at.replace(tzinfo=None)).total_seconds()
-                delay = max(0, seconds - int(age))
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                remain = max(0, seconds - int(age))
+                if remain > 0:
+                    await asyncio.sleep(remain)
 
-                # Re-check rule & message state
                 rule = await self._get_rule(message.channel.id)
                 if not rule or not rule["enabled"]:
                     return
-                # If the rule seconds changed, only delete if still within *current* threshold
-                if rule["seconds"] != seconds:
-                    # If it's still younger than current rule, proceed
-                    now2 = dt.datetime.utcnow()
-                    age2 = (now2 - message.created_at.replace(tzinfo=None)).total_seconds()
-                    if age2 > rule["seconds"]:
-                        return
-
-                # Skip pinned or already deleted
+                # re-apply filter at deletion time
+                if not self._passes_user_filter(message.author.id, rule.get("users_mode", "all"), rule.get("users_csv", "")):
+                    return
+                # skip pinned/deleted
                 if getattr(message, "pinned", False):
                     return
-                await message.delete(reason=f"Auto-delete after {rule['seconds']}s")
+                await message.delete(reason=f"Auto-delete {pretty_duration(int(rule['seconds']))}")
             except discord.NotFound:
-                pass  # already gone
+                pass
             except discord.Forbidden:
-                pass  # missing perms
+                pass
             except Exception:
-                # don't spam logs with cancellations
                 pass
             finally:
                 self._tasks.pop(message.id, None)
 
         self._tasks[message.id] = asyncio.create_task(runner())
 
-    async def _backfill_recent(self, channel: discord.abc.Messageable, seconds: int, limit: int = 100) -> int:
-        scheduled = 0
+    async def _backfill_recent(self, channel: discord.TextChannel, seconds: int, *, users_mode: str, users: str, limit: int = 100) -> int:
+        count = 0
         async for msg in channel.history(limit=limit, oldest_first=False):
             if msg.type != discord.MessageType.default:
                 continue
-            if msg.author.bot and msg.author.id == self.bot.user.id:
-                continue
             if getattr(msg, "pinned", False):
                 continue
-            # remaining time
+            if msg.author.id == getattr(self.bot.user, "id", None):
+                continue
+            if not self._passes_user_filter(msg.author.id, users_mode, users):
+                continue
+
             age = (dt.datetime.utcnow() - msg.created_at.replace(tzinfo=None)).total_seconds()
             remain = int(seconds - age)
             if remain <= 0:
-                # try to delete immediately if still within the policy (race window)
                 try:
-                    await msg.delete(reason=f"Auto-delete backfill ≤ {seconds}s")
-                    scheduled += 1
+                    await msg.delete(reason=f"Auto-delete backfill ≤ {pretty_duration(seconds)}")
+                    count += 1
                 except Exception:
                     pass
-                continue
-            await self._schedule_delete(msg, seconds)
-            scheduled += 1
-        return scheduled
+            else:
+                await self._schedule_delete(msg, seconds, users_mode=users_mode, users_csv=users)
+                count += 1
+        return count
 
+    # ----- Events -----
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # Ignore DMs / no guild / self
-        if not message.guild or message.author.id == getattr(self.bot.user, "id", None):
+        if not message.guild:
             return
-        # Only standard user messages
+        if message.author.id == getattr(self.bot.user, "id", None):
+            return
         if message.type != discord.MessageType.default:
             return
 
         rule = await self._get_rule(message.channel.id)
         if not rule or not rule["enabled"]:
             return
-        seconds = int(rule["seconds"])
-        # schedule per-message deletion (supports <60s)
-        await self._schedule_delete(message, seconds)
+        if not self._passes_user_filter(message.author.id, rule.get("users_mode", "all"), rule.get("users_csv", "")):
+            return
 
-    # ---------- Slash: UI ----------
+        await self._schedule_delete(
+            message,
+            int(rule["seconds"]),
+            users_mode=rule.get("users_mode", "all"),
+            users_csv=rule.get("users_csv", ""),
+        )
 
-    @app_commands.command(name="autodelete", description="Configure auto-delete rules for this channel.")
+    # ----- Slash: UI -----
+    @app_commands.command(name="autodelete", description="Configure auto-delete rules for a channel.")
     @app_commands.default_permissions(manage_messages=True)
     async def autodelete(self, inter: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-        channel = channel or inter.channel  # default to current channel
-        if not isinstance(channel, discord.TextChannel):
+        ch = channel or inter.channel
+        if not isinstance(ch, discord.TextChannel):
             return await inter.response.send_message("Pick a text channel.", ephemeral=True)
 
-        view = AutoDeleteView(self, channel)
-        # initial state
-        rule = await self._get_rule(channel.id)
-        status = "Enabled" if (rule and rule["enabled"]) else "Disabled"
-        sec = rule["seconds"] if rule else None
-        desc = (
-            f"**Status:** {status}\n"
-            + (f"**Delay:** {sec}s\n" if sec is not None else "No rule set yet.\n")
-            + "Use the buttons below to configure this channel."
-        )
-        embed = discord.Embed(
-            title=f"🧹 Auto-Delete — #{channel.name}",
-            description=desc,
-            color=discord.Color.blurple(),
-        )
+        view = AutoDeleteView(self, ch)
+        rule = await self._get_rule(ch.id)
+        enabled = bool(rule and rule["enabled"])
+        seconds = int(rule["seconds"]) if rule else None
+        mode = (rule or {}).get("users_mode", "all")
+        users_csv = (rule or {}).get("users_csv", "")
+        users_list = [int(x) for x in users_csv.split(",") if x.strip().isdigit()]
+        desc = [
+            f"**Status:** {'Enabled' if enabled else 'Disabled'}",
+            f"**Duration:** {pretty_duration(seconds) if seconds is not None else '(none)'}",
+            f"**User filter:** `{mode}` " + ("" if mode == "all" else (", ".join(f\"<@{i}>\" for i in users_list) or "(none)")),
+            "\nUse the buttons below to configure this channel."
+        ]
+        embed = discord.Embed(title=f"🧹 Auto-Delete — #{ch.name}", description="\n".join(desc), color=discord.Color.blurple())
         await inter.response.send_message(embed=embed, view=view, ephemeral=True)
         msg = await inter.original_response()
         view.message_id = msg.id
 
-    # ---------- Slash: Purge ----------
-
+    # ----- Slash: Purge -----
     @app_commands.command(name="purge", description="Bulk delete recent messages in this channel.")
     @app_commands.default_permissions(manage_messages=True)
     @app_commands.describe(
@@ -303,7 +411,6 @@ class AutoDeleteCog(commands.Cog):
     ):
         if not isinstance(inter.channel, discord.TextChannel):
             return await inter.response.send_message("Run this in a text channel.", ephemeral=True)
-
         await inter.response.defer(ephemeral=True)
 
         def check(m: discord.Message) -> bool:
