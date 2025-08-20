@@ -18,15 +18,15 @@ class BusinessCog(commands.Cog):
         if self._payout_task.is_running():
             self._payout_task.cancel()
 
-    @app_commands.command(name="biz_list", description="List available businesses to buy.")
-    async def biz_list(self, inter: discord.Interaction):
+    @app_commands.command(name="business_list", description="List available businesses to buy.")
+    async def business_list(self, inter: discord.Interaction):
         with self.bot.SessionLocal() as s:
             rows = s.query(Business).all()
             desc = "\n".join([f"- **{b.name}** — cost {b.cost}, yields {b.hourly_yield}/hr" for b in rows]) or "None."
             await inter.response.send_message(embed=discord.Embed(title="🏢 Businesses", description=desc))
 
-    @app_commands.command(name="biz_buy", description="Buy a business.")
-    async def biz_buy(self, inter: discord.Interaction, name: str):
+    @app_commands.command(name="business_buy", description="Buy a business.")
+    async def business_buy(self, inter: discord.Interaction, name: str):
         with self.bot.SessionLocal() as s:
             _, bal = ensure_user(s, inter.user.id)
             biz = s.query(Business).filter(Business.name.ilike(name)).first()
@@ -39,8 +39,8 @@ class BusinessCog(commands.Cog):
             s.commit()
             await inter.response.send_message(f"✅ Bought **{biz.name}**. Balance: {bal.credits}.")
 
-    @app_commands.command(name="biz_my", description="Your owned businesses.")
-    async def biz_my(self, inter: discord.Interaction):
+    @app_commands.command(name="business_my", description="Your owned businesses.")
+    async def business_my(self, inter: discord.Interaction):
         with self.bot.SessionLocal() as s:
             q = s.query(Ownership, Business).join(Business, Ownership.business_id == Business.id).filter(Ownership.user_id==inter.user.id).all()
             if not q:
