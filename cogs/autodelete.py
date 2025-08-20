@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import re
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from sqlalchemy import text
 
@@ -218,17 +218,27 @@ class AutoDeleteView(discord.ui.View):
 
 # ---------- Cog ----------
 class AutoDeleteCog(commands.Cog):
-    """Per-channel auto-delete with per-message timers + user filters + purge."""
+    """Per-channel auto-delete with per-message timers + user filters + purge + micro-sweeper."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._rule_cache: Dict[int, Dict[str, str | int]] = {}
         self._tasks: Dict[int, asyncio.Task] = {}
+        self._seen_recent: Set[int] = set()  # message ids recently scheduled by sweeper
 
         with self.bot.engine.begin() as c:
             c.execute(text(CREATE_RULES_SQL))
             try: c.execute(text(ALTER_ADD_USERS_MODE))
             except Exception: pass
             try: c.execute(text(ALTER_ADD_USERS_CSV))
+            except Exception: pass
+
+        # Start micro-sweeper
+        self.sweeper.start()
+
+    def cog_unload(self):
+        self.sweeper.cancel()
+        for t in list(self._tasks.values()):
+            try: t.cancel()
             except Exception: pass
 
     # ----- DB I/O -----
@@ -256,6 +266,7 @@ class AutoDeleteCog(commands.Cog):
         rule = await self._get_rule(channel_id) or {}
         rule.update({"seconds": seconds, "enabled": 1 if enabled else 0})
         self._rule_cache[channel_id] = rule
+        print(f"[autodelete] Rule set: channel={channel_id} seconds={seconds} enabled={enabled}")
 
     async def _set_filter(self, channel_id: int, *, mode: str, users_csv: str):
         with self.bot.engine.begin() as c:
@@ -265,6 +276,7 @@ class AutoDeleteCog(commands.Cog):
         rule = await self._get_rule(channel_id) or {}
         rule.update({"users_mode": mode, "users_csv": users_csv})
         self._rule_cache[channel_id] = rule
+        print(f"[autodelete] Filter set: channel={channel_id} mode={mode} users={users_csv}")
 
     # ----- Filter check -----
     def _passes_user_filter(self, author_id: int, mode: str, users_csv: str) -> bool:
@@ -279,9 +291,9 @@ class AutoDeleteCog(commands.Cog):
 
     # ----- Scheduling -----
     async def _schedule_delete(self, message: discord.Message, seconds: int, *, users_mode="all", users_csv=""):
+        # avoid double-schedule from sweeper+on_message
         if message.id in self._tasks:
-            try: self._tasks[message.id].cancel()
-            except Exception: pass
+            return
 
         async def runner():
             try:
@@ -298,17 +310,22 @@ class AutoDeleteCog(commands.Cog):
                     return
                 if getattr(message, "pinned", False):
                     return
+
                 await message.delete(reason=f"Auto-delete {pretty_duration(int(rule['seconds']))}")
+                print(f"[autodelete] Deleted msg {message.id} in {message.channel.id}")
             except discord.NotFound:
                 pass
             except discord.Forbidden:
-                pass
-            except Exception:
-                pass
+                print(f"[autodelete] Missing permission to delete in channel {message.channel.id}")
+            except Exception as e:
+                print(f"[autodelete] Error deleting msg {message.id}: {e}")
             finally:
                 self._tasks.pop(message.id, None)
+                self._seen_recent.discard(message.id)
 
         self._tasks[message.id] = asyncio.create_task(runner())
+        self._seen_recent.add(message.id)
+        print(f"[autodelete] Scheduled msg {message.id} in {message.channel.id} after {seconds}s")
 
     async def _backfill_recent(self, channel: discord.TextChannel, seconds: int, *, users_mode: str, users: str, limit: int = 100) -> int:
         count = 0
@@ -358,6 +375,41 @@ class AutoDeleteCog(commands.Cog):
             users_csv=rule.get("users_csv", ""),
         )
 
+    # ----- Micro-sweeper (5s) -----
+    @tasks.loop(seconds=5.0)
+    async def sweeper(self):
+        try:
+            # collect enabled channels
+            with self.bot.engine.connect() as c:
+                rows = c.execute(text("SELECT channel_id, seconds, users_mode, users_csv FROM autodelete_rules WHERE enabled=1")).fetchall()
+            for row in rows:
+                ch_id, sec, mode, users = int(row[0]), int(row[1]), str(row[2]), str(row[3])
+                ch = self.bot.get_channel(ch_id)
+                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    continue
+                # look at a small recent window so this is cheap
+                async for msg in ch.history(limit=25, oldest_first=False):
+                    if msg.type != discord.MessageType.default:
+                        continue
+                    if getattr(msg, "pinned", False):
+                        continue
+                    if msg.author.id == getattr(self.bot.user, "id", None):
+                        continue
+                    if not self._passes_user_filter(msg.author.id, mode, users):
+                        continue
+                    if msg.id in self._tasks or msg.id in self._seen_recent:
+                        continue
+                    # schedule if still within window
+                    age = (dt.datetime.utcnow() - msg.created_at.replace(tzinfo=None)).total_seconds()
+                    if age < sec:
+                        await self._schedule_delete(msg, sec, users_mode=mode, users_csv=users)
+        except Exception as e:
+            print(f"[autodelete] sweeper error: {e}")
+
+    @sweeper.before_loop
+    async def before_sweeper(self):
+        await self.bot.wait_until_ready()
+
     # ----- Slash: UI -----
     @app_commands.command(name="autodelete", description="Configure auto-delete rules for a channel.")
     @app_commands.default_permissions(manage_messages=True)
@@ -389,40 +441,4 @@ class AutoDeleteCog(commands.Cog):
     # ----- Slash: Purge -----
     @app_commands.command(name="purge", description="Bulk delete recent messages in this channel.")
     @app_commands.default_permissions(manage_messages=True)
-    @app_commands.describe(
-        amount="How many messages to scan (max 1000).",
-        contains="Only delete messages containing this text.",
-        user="Only delete messages from this user.",
-        bots_only="Only delete messages from bots.",
-    )
-    async def purge(
-        self,
-        inter: discord.Interaction,
-        amount: app_commands.Range[int, 1, 1000],
-        contains: Optional[str] = None,
-        user: Optional[discord.Member] = None,
-        bots_only: Optional[bool] = False,
-    ):
-        if not isinstance(inter.channel, discord.TextChannel):
-            return await inter.response.send_message("Run this in a text channel.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
-
-        def check(m: discord.Message) -> bool:
-            if user and m.author.id != user.id:
-                return False
-            if bots_only and not m.author.bot:
-                return False
-            if contains and (contains.lower() not in (m.content or "").lower()):
-                return False
-            return True
-
-        try:
-            deleted = await inter.channel.purge(limit=amount, check=check, bulk=True, reason="Moderator purge")
-            await inter.followup.send(f"🧽 Purged **{len(deleted)}** messages.", ephemeral=True)
-        except discord.Forbidden:
-            await inter.followup.send("I don't have permission to delete messages here.", ephemeral=True)
-        except Exception as e:
-            await inter.followup.send(f"Error: {e}", ephemeral=True)
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(AutoDeleteCog(bot))
+    @app_commands.descri
