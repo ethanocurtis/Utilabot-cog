@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 # --- Env (backward compatible with your old .env) ---
 KUTT_HOST = (os.getenv("KUTT_HOST") or os.getenv("KUTT_BASE_URL") or "https://kutt.it").rstrip("/")
 KUTT_API = os.getenv("KUTT_API") or os.getenv("KUTT_API_KEY")
-KUTT_DOMAIN = os.getenv("KUTT_DOMAIN") or os.getenv("KUTT_LINK_DOMAIN")  # domain name only, e.g. glint.zip
+KUTT_DOMAIN = os.getenv("KUTT_DOMAIN") or os.getenv("KUTT_LINK_DOMAIN")  # e.g. glint.zip (no scheme)
 KUTT_FORCE_DOMAIN = os.getenv("KUTT_FORCE_DOMAIN", "false").lower() in ("1", "true", "yes")
 
 def _scheme_from_host(host: str) -> str:
@@ -22,27 +22,19 @@ def _netloc_from_host(host: str) -> str:
     return parsed.netloc or host
 
 def _build_short_url(data: dict) -> str:
-    """
-    Construct a short URL from Kutt response.
-    Prefer 'link' if present; otherwise build from domain+address.
-    """
-    # 1) If Kutt already gave us the final link, use it.
+    """Construct a short URL from Kutt response."""
     link = data.get("link") or data.get("shortUrl")
     if isinstance(link, str) and link.strip():
         return link
 
-    # 2) Build it from 'address'
     address = data.get("address")
     if not address:
-        # last fallback: show raw data (caller will handle as error)
         return ""
 
-    # Prefer configured domain if provided
     if KUTT_DOMAIN:
         scheme = "https" if KUTT_HOST.startswith("https://") else "http"
         return f"{scheme}://{KUTT_DOMAIN.strip('/')}/{address}"
 
-    # Otherwise fall back to the host we're calling
     netloc = _netloc_from_host(KUTT_HOST)
     scheme = _scheme_from_host(KUTT_HOST)
     return f"{scheme}://{netloc}/{address}"
@@ -91,13 +83,14 @@ class KuttCog(commands.Cog):
                 async with session.post(
                     f"{KUTT_HOST}/api/v2/links", json=payload, headers=headers, timeout=timeout
                 ) as r:
+                    status = r.status
                     try:
                         data = await r.json()
                     except Exception:
-                        data = {"error": (await r.text()) or f"HTTP {r.status}"}
-                    return r.status, data
+                        data = {"error": (await r.text()) or f"HTTP {status}"}
+                    return status, data
 
-        # Try with domain only if explicitly forced (mirrors your old setup)
+        # Include domain only if explicitly forced (matches your old setup)
         payload = dict(base_payload)
         used_domain = False
         if KUTT_FORCE_DOMAIN and KUTT_DOMAIN:
@@ -108,17 +101,19 @@ class KuttCog(commands.Cog):
 
         # If domain causes a permission error, retry without it
         err_text = (str(data.get("error", "")) if isinstance(data, dict) else "").lower()
-        if status != 200 and used_domain and ("only users" in err_text or "domain" in err_text or status in (401, 403)):
+        if (status < 200 or status >= 300) and used_domain and (
+            "only users" in err_text or "domain" in err_text or status in (401, 403)
+        ):
             status, data = await create_link(base_payload)
             used_domain = False
 
-        # Success path: Kutt may return the object (id/address/target) even without 'link'
-        if status == 200 and isinstance(data, dict) and not data.get("error"):
+        # Success on any 2xx
+        if 200 <= status < 300 and isinstance(data, dict) and not data.get("error"):
             short_url = _build_short_url(data)
             if short_url:
                 target = data.get("target") or url
                 return await inter.followup.send(f"🔗 **{short_url}** → {target}", ephemeral=False)
-            # If we couldn't build, fall through to error messaging below with raw data
+            # fall through if we somehow couldn't build it
 
         # Error path
         hints = []
