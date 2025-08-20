@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import re
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 import discord
 from discord.ext import commands
@@ -57,7 +57,6 @@ def pretty_duration(sec: int) -> str:
 
 def parse_user_list(input_text: str) -> List[int]:
     ids: List[int] = []
-    # accept mentions like <@123>, <@!123>, raw IDs, or @username (ignored)
     for token in re.split(r"[,\s]+", input_text.strip()):
         if not token:
             continue
@@ -67,7 +66,6 @@ def parse_user_list(input_text: str) -> List[int]:
             continue
         if token.isdigit():
             ids.append(int(token))
-    # dedupe
     return list(dict.fromkeys(ids))
 
 # ---------- UI Modals ----------
@@ -76,7 +74,7 @@ class SecondsModal(discord.ui.Modal, title="Set Auto-Delete Duration"):
         super().__init__(timeout=180)
         self.view_ref = view
         self.input = discord.ui.TextInput(
-            label=f"Duration (e.g. 10s, 20m, 1h, 1h20m10s)",
+            label="Duration (e.g. 10s, 20m, 1h, 1h20m10s)",
             placeholder="e.g. 45s",
             max_length=20,
             required=True,
@@ -91,7 +89,7 @@ class SecondsModal(discord.ui.Modal, title="Set Auto-Delete Duration"):
         ch = self.view_ref.channel
         cog: AutoDeleteCog = self.view_ref.cog
         await cog._set_rule(ch.id, seconds=sec, enabled=True)
-        # modal path: defer and edit via followup
+
         await interaction.response.defer(ephemeral=True)
         await self.view_ref.refresh(interaction)
         await interaction.followup.send(f"✅ Duration set to **{pretty_duration(sec)}** for {ch.mention}.", ephemeral=True)
@@ -145,13 +143,13 @@ class AutoDeleteView(discord.ui.View):
         mode = (rule or {}).get("users_mode", "all")
         users_csv = (rule or {}).get("users_csv", "")
         users = [int(x) for x in users_csv.split(",") if x.strip().isdigit()]
+        user_list_str = "" if mode == "all" else (", ".join(f"<@{i}>" for i in users) or "(none)")
 
         desc = []
         desc.append(f"**Status:** {'Enabled' if enabled else 'Disabled'}")
         if seconds is not None:
             desc.append(f"**Duration:** {pretty_duration(seconds)}")
-        desc.append(f"**User filter:** `{mode}` " +
-                    ("" if mode == "all" else (", ".join(f"<@{i}>" for i in users) or "(none)")))
+        desc.append(f"**User filter:** `{mode}` {user_list_str}")
         desc.append("\nUse buttons below to configure this channel.")
         embed = discord.Embed(
             title=f"🧹 Auto-Delete — #{self.channel.name}",
@@ -162,12 +160,10 @@ class AutoDeleteView(discord.ui.View):
         self.enable_button.disabled = enabled
         self.disable_button.disabled = not enabled
 
-        # Component interactions can directly edit
         if getattr(interaction, "message", None) is not None and not interaction.response.is_done():
             await interaction.response.edit_message(embed=embed, view=self)
             return
 
-        # Modal path: defer and edit via followup
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
         if self.message_id:
@@ -225,12 +221,11 @@ class AutoDeleteCog(commands.Cog):
     """Per-channel auto-delete with per-message timers + user filters + purge."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._rule_cache: Dict[int, Dict[str, str | int]] = {}  # channel_id -> rule dict
-        self._tasks: Dict[int, asyncio.Task] = {}               # message_id -> task
+        self._rule_cache: Dict[int, Dict[str, str | int]] = {}
+        self._tasks: Dict[int, asyncio.Task] = {}
 
         with self.bot.engine.begin() as c:
             c.execute(text(CREATE_RULES_SQL))
-            # migrate columns if missing
             try: c.execute(text(ALTER_ADD_USERS_MODE))
             except Exception: pass
             try: c.execute(text(ALTER_ADD_USERS_CSV))
@@ -290,7 +285,6 @@ class AutoDeleteCog(commands.Cog):
 
         async def runner():
             try:
-                # initial wait
                 now = dt.datetime.utcnow()
                 age = (now - message.created_at.replace(tzinfo=None)).total_seconds()
                 remain = max(0, seconds - int(age))
@@ -300,10 +294,8 @@ class AutoDeleteCog(commands.Cog):
                 rule = await self._get_rule(message.channel.id)
                 if not rule or not rule["enabled"]:
                     return
-                # re-apply filter at deletion time
                 if not self._passes_user_filter(message.author.id, rule.get("users_mode", "all"), rule.get("users_csv", "")):
                     return
-                # skip pinned/deleted
                 if getattr(message, "pinned", False):
                     return
                 await message.delete(reason=f"Auto-delete {pretty_duration(int(rule['seconds']))}")
@@ -381,11 +373,13 @@ class AutoDeleteCog(commands.Cog):
         mode = (rule or {}).get("users_mode", "all")
         users_csv = (rule or {}).get("users_csv", "")
         users_list = [int(x) for x in users_csv.split(",") if x.strip().isdigit()]
+        user_list_str = "" if mode == "all" else (", ".join(f"<@{i}>" for i in users_list) or "(none)")
+
         desc = [
             f"**Status:** {'Enabled' if enabled else 'Disabled'}",
             f"**Duration:** {pretty_duration(seconds) if seconds is not None else '(none)'}",
-            f"**User filter:** `{mode}` " + ("" if mode == "all" else (", ".join(f\"<@{i}>\" for i in users_list) or "(none)")),
-            "\nUse the buttons below to configure this channel."
+            f"**User filter:** `{mode}` {user_list_str}",
+            "\nUse the buttons below to configure this channel.",
         ]
         embed = discord.Embed(title=f"🧹 Auto-Delete — #{ch.name}", description="\n".join(desc), color=discord.Color.blurple())
         await inter.response.send_message(embed=embed, view=view, ephemeral=True)
