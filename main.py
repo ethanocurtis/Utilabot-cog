@@ -20,6 +20,7 @@ COGS = [
     "cogs.reminders",
     "cogs.notes",
     "cogs.kutt",
+    "cogs.reload",
 ]
 
 class UtilaBot(commands.Bot):
