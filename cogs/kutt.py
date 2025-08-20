@@ -122,7 +122,7 @@ class KuttCog(commands.Cog):
         if (200 <= status < 300) or looks_like_link:
             short = _short_url_from_payload(data if isinstance(data, dict) else {})
             if short:
-                return await inter.followup.send(f"Shortened: {short}", ephemeral=False)
+                return await inter.followup.send(f"🔗Shortened: {short}", ephemeral=False)
 
         # Otherwise show a concise error
         hints = []
