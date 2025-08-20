@@ -1,9 +1,10 @@
+
 import os
 import asyncio
 import discord
 from discord.ext import commands
 from utils.db import init_engine_and_session, run_migrations
-from wx_store import WxStore
+from wx_store import WxStore  # <-- storage adapter for weather cog
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -27,9 +28,14 @@ class UtilaBot(commands.Bot):
         db_path = os.environ.get("DATA_PATH", "/app/data/bot.db")
         self.engine, self.SessionLocal = init_engine_and_session(db_path)
 
+        # >>> IMPORTANT: attach store BEFORE setup_hook (cogs load there)
+        self.store = WxStore(self.engine) 
+
     async def setup_hook(self):
         # Ensure DB schema exists
         run_migrations(self.engine)
+        # Optional: quick sanity print (remove later)
+        print("Store attached:", type(getattr(self, "store", None)))
         # Load cogs
         for cog in COGS:
             await self.load_extension(cog)
