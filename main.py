@@ -21,6 +21,7 @@ COGS = [
     "cogs.notes",
     "cogs.kutt",
     "cogs.reload",
+    "cogs.autodelete",
 ]
 
 class UtilaBot(commands.Bot):
