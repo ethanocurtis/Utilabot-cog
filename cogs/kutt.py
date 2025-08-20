@@ -7,11 +7,10 @@ from discord.ext import commands
 from discord import app_commands
 from urllib.parse import urlparse
 
-# ---- ENV (back-compat with your old bot) ----
+# ---- ENV (compat with old bot) ----
 KUTT_HOST = (os.getenv("KUTT_HOST") or os.getenv("KUTT_BASE_URL") or "https://kutt.it").rstrip("/")
 KUTT_API  = os.getenv("KUTT_API") or os.getenv("KUTT_API_KEY")
-KUTT_DOMAIN = os.getenv("KUTT_DOMAIN") or os.getenv("KUTT_LINK_DOMAIN")  # e.g. glint.zip (no scheme)
-# Only send the 'domain' field if explicitly forced (old bot usually didn't)
+KUTT_DOMAIN = os.getenv("KUTT_DOMAIN") or os.getenv("KUTT_LINK_DOMAIN")
 KUTT_FORCE_DOMAIN = os.getenv("KUTT_FORCE_DOMAIN", "false").lower() in ("1", "true", "yes")
 
 def _scheme(host: str) -> str:
@@ -23,12 +22,10 @@ def _netloc(host: str) -> str:
     return p.netloc or host
 
 def _short_url_from_payload(d: dict) -> str:
-    # Prefer direct link fields
     for k in ("link", "shortUrl"):
         v = d.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # Build from address
     addr = d.get("address")
     if not addr:
         return ""
@@ -87,7 +84,6 @@ class KuttCog(commands.Cog):
                         data = {"error": (await r.text()) or f"HTTP {status}"}
                     return status, data
 
-        # Only include 'domain' if explicitly forced
         payload = dict(base_payload)
         used_domain = False
         if KUTT_FORCE_DOMAIN and KUTT_DOMAIN:
@@ -99,7 +95,7 @@ class KuttCog(commands.Cog):
         if status in (404, 405):
             status, data = await _post("/api/v2/links", payload)
 
-        # If domain causes a permission issue, retry without it
+        # Retry without domain if needed
         errmsg = (str(data.get("error", "")) if isinstance(data, dict) else "").lower()
         if (status < 200 or status >= 300) and used_domain and (
             "domain" in errmsg or "only users" in errmsg or status in (401, 403)
@@ -109,16 +105,17 @@ class KuttCog(commands.Cog):
                 status, data = await _post("/api/v2/links", base_payload)
             used_domain = False
 
-        # Treat success if 2xx OR if Kutt clearly returned a link object (address/link)
-        is_2xx = 200 <= status < 300
-        looks_like_link = isinstance(data, dict) and any(k in data for k in ("address", "link", "shortUrl"))
-        if is_2xx or looks_like_link:
+        # ✅ SUCCESS if:
+        #   - 2xx, OR
+        #   - dict has any of ('address','id','link','shortUrl','target')
+        looks_like_link = isinstance(data, dict) and any(k in data for k in ("address", "id", "link", "shortUrl", "target"))
+        if (200 <= status < 300) or looks_like_link:
             short = _short_url_from_payload(data if isinstance(data, dict) else {})
             if short:
                 target = data.get("target") if isinstance(data, dict) else None
                 return await inter.followup.send(f"🔗 **{short}** → {target or url}", ephemeral=False)
 
-        # Otherwise show a helpful error
+        # ❌ Error
         hints = []
         msg = str(data)
         if status == 401 or "unauthorized" in msg.lower():
