@@ -1,7 +1,7 @@
 
 # cogs/moderation.py
 import re
-from typing import Optional
+from typing import Optional, Dict
 
 import discord
 from discord import app_commands
@@ -15,6 +15,7 @@ def _has_guild_admin_perms(inter: discord.Interaction) -> bool:
     except Exception:
         pass
     return False
+
 
 class Moderation(commands.Cog):
     """
@@ -46,6 +47,79 @@ class Moderation(commands.Cog):
             await inter.response.send_message("Use this in a text channel.", ephemeral=True)
             return False
         return True
+
+    # ---- persistence abstraction (supports both Store and WxStore) ----
+    def _ad_key(self, channel_id: int) -> str:
+        return f"autodelete:{int(channel_id)}"
+
+    def _ad_set(self, channel_id: int, seconds: int) -> None:
+        if not self.store:
+            raise RuntimeError("No store attached")
+        # Preferred: dedicated methods
+        if hasattr(self.store, "set_autodelete"):
+            return self.store.set_autodelete(int(channel_id), int(seconds))
+        # Fallback: config-style store (WxStore)
+        if hasattr(self.store, "set_config"):
+            return self.store.set_config(self._ad_key(channel_id), int(seconds))
+        raise AttributeError("Store missing set_autodelete and set_config")
+
+    def _ad_remove(self, channel_id: int) -> None:
+        if not self.store:
+            raise RuntimeError("No store attached")
+        if hasattr(self.store, "remove_autodelete"):
+            return self.store.remove_autodelete(int(channel_id))
+        if hasattr(self.store, "delete_config"):
+            return self.store.delete_config(self._ad_key(channel_id))
+        raise AttributeError("Store missing remove_autodelete and delete_config")
+
+    def _ad_get_map(self) -> Dict[str, int]:
+        """
+        Returns {channel_id_str: seconds}
+        """
+        if not self.store:
+            return {}
+        # Dedicated table
+        if hasattr(self.store, "get_autodelete"):
+            try:
+                return dict(self.store.get_autodelete() or {})
+            except Exception:
+                pass
+        # Config table: require get_config_all to list
+        if hasattr(self.store, "get_config_all"):
+            try:
+                raw = self.store.get_config_all() or {}
+                out = {}
+                for k, v in raw.items():
+                    if isinstance(k, str) and k.startswith("autodelete:"):
+                        try:
+                            cid = k.split(":", 1)[1]
+                            out[str(int(cid))] = int(v)
+                        except Exception:
+                            continue
+                return out
+            except Exception:
+                pass
+        # Best-effort: no way to list all; return empty and rely on status per channel
+        return {}
+
+    def _ad_get_for_channel(self, channel_id: int) -> int:
+        """
+        Returns seconds for channel or 0 if off, even for stores without listing.
+        """
+        if not self.store:
+            return 0
+        # Direct map if available
+        m = self._ad_get_map()
+        if m:
+            return int(m.get(str(int(channel_id)), 0))
+        # Try single-key read on config stores
+        if hasattr(self.store, "get_config"):
+            try:
+                v = self.store.get_config(self._ad_key(channel_id))
+                return int(v) if v is not None else 0
+            except Exception:
+                return 0
+        return 0
 
     # ---------- /purge ----------
     @app_commands.command(name="purge", description="Bulk delete recent messages (max 1000).")
@@ -103,16 +177,8 @@ class Moderation(commands.Cog):
 
         act = action.value
 
-        # Read current map if store available
-        ad_map = {}
-        try:
-            if self.store and hasattr(self.store, "get_autodelete"):
-                ad_map = self.store.get_autodelete() or {}
-        except Exception:
-            ad_map = {}
-
         if act == "status":
-            seconds = int(ad_map.get(str(inter.channel.id), 0))
+            seconds = self._ad_get_for_channel(inter.channel.id)
             if seconds <= 0:
                 return await inter.response.send_message("ℹ️ Auto-delete is **off** for this channel.", ephemeral=True)
             pretty = self._pretty_seconds(seconds)
@@ -125,6 +191,7 @@ class Moderation(commands.Cog):
                 return await inter.response.send_message(
                     "You need **Administrator/Manage Server** or be on the bot's admin allowlist.", ephemeral=True
                 )
+            ad_map = self._ad_get_map()
             if not ad_map:
                 return await inter.response.send_message("No channels have auto-delete configured.", ephemeral=True)
             # Try to resolve channel names in this guild only
@@ -148,7 +215,7 @@ class Moderation(commands.Cog):
 
         if act == "disable":
             try:
-                self.store.remove_autodelete(inter.channel.id)
+                self._ad_remove(inter.channel.id)
             except Exception as e:
                 return await inter.response.send_message(f"Error disabling: {e}", ephemeral=True)
             return await inter.response.send_message("🛑 Auto-delete disabled for this channel.", ephemeral=True)
@@ -168,7 +235,7 @@ class Moderation(commands.Cog):
                     "Range must be **5 seconds** to **24 hours**.", ephemeral=True
                 )
             try:
-                self.store.set_autodelete(inter.channel.id, int(seconds))
+                self._ad_set(inter.channel.id, int(seconds))
             except Exception as e:
                 return await inter.response.send_message(f"Error saving: {e}", ephemeral=True)
 
