@@ -23,6 +23,7 @@ COGS = [
     "cogs.reload",
     "cogs.moderation_cog",
     "cogs.pins",
+    "cogs.audio",
 ]
 
 class UtilaBot(commands.Bot):
