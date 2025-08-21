@@ -4,7 +4,12 @@ from typing import Optional, Dict, Any, List
 from sqlalchemy import text
 
 class WxStore:
-    "
+from __future__ import annotations
+from typing import Optional, Dict, Any, List
+from sqlalchemy import text
+
+class WxStore:
+    """
     Minimal storage adapter for the weather cog.
 
     Tables expected in DB:
@@ -14,7 +19,7 @@ class WxStore:
                               hh INTEGER, mi INTEGER, weekly_days INTEGER,
                               next_run_utc TEXT)
       - notes(user_id INTEGER, k TEXT, v TEXT, PRIMARY KEY(user_id, k))
-    "
+    """
     def __init__(self, engine):
         self.engine = engine
         # Some code in the cog calls self.store.db.execute(...)
