@@ -1,12 +1,7 @@
-
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 from sqlalchemy import text
 
-class WxStore:
-from __future__ import annotations
-from typing import Optional, Dict, Any, List
-from sqlalchemy import text
 
 class WxStore:
     """
