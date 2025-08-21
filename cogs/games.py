@@ -245,7 +245,7 @@ class GamesCog(commands.Cog):
                 return int(bal.credits)
         return await asyncio.to_thread(_work)
 
-@app_commands.command(name="coinflip", description="Bet on a coin flip.")
+    @app_commands.command(name="coinflip", description="Bet on a coin flip.")
     @app_commands.describe(bet="Bet amount in credits")
     @app_commands.choices(
         choice=[
