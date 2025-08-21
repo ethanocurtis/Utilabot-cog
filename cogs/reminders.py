@@ -333,13 +333,24 @@ class Reminders(commands.Cog):
         rows = self._list_reminders(inter.user.id)
         if not rows:
             return await inter.response.send_message("You have no reminders.", ephemeral=True)
-        lines = []
+
+        embed = discord.Embed(
+            title="⏰ Your Reminders",
+            description="Times shown in America/Chicago",
+            color=discord.Color.blurple()
+        )
+
         for rid, text_, due_iso, interval, unit, dm in rows:
             due_local = _utc_naive_to_central(dt.datetime.fromisoformat(due_iso))
-            tag = "DM" if dm else "CHAN"
-            cadence = f" · every {interval} {unit}" if interval and unit else ""
-            lines.append(f"`{rid:04d}` [{tag}] due {due_local:%Y-%m-%d %I:%M %p %Z}{cadence} — {text_}")
-        await inter.response.send_message("**Your reminders (America/Chicago):**\n" + "\n".join(lines), ephemeral=True)
+            tag = "📩 DM" if dm else "💬 Channel"
+            cadence = f"\n🔁 Every {interval} {unit}" if interval and unit else ""
+            embed.add_field(
+                name=f"#{rid:04d} — {due_local:%Y-%m-%d %I:%M %p %Z}",
+                value=f"{tag}{cadence}\n**{text_}**",
+                inline=False
+            )
+
+        await inter.response.send_message(embed=embed, ephemeral=True)
 
     @group.command(name="remove", description="Remove a reminder by ID")
     async def remind_remove(self, inter: discord.Interaction, reminder_id: int):
