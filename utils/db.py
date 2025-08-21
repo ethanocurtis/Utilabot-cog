@@ -180,8 +180,8 @@ def run_migrations(engine):
             ])
         if not s.query(Business).first():
             s.add_all([
-                Business(name="Lemonade Stand", cost=500, hourly_yield=20),
-                Business(name="Food Truck", cost=2500, hourly_yield=120),
-                Business(name="Arcade", cost=10000, hourly_yield=600),
+                Business(name="Lemonade Stand", cost=2500, hourly_yield=200),
+                Business(name="Food Truck", cost=250000, hourly_yield=1200),
+                Business(name="Arcade", cost=1000000, hourly_yield=6000),
             ])
         s.commit()
