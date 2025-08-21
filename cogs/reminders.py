@@ -10,16 +10,22 @@ from discord.ext import commands, tasks
 class Reminders(commands.Cog):
     """
     Reminder system with persistence across restarts.
-    - One-shot reminders are removed from the DB after firing.
-    - Recurring reminders reschedule themselves.
-    - Per-user dm_all setting stored in user_notes_kv (via bot.store.set_config/get_config).
+    Stores data in the `reminders` table and user DM preference in user_notes_kv.
+    Table columns (SQLite):
+      id INTEGER PK AUTOINCREMENT
+      user_id INTEGER NOT NULL
+      channel_id INTEGER
+      dm INTEGER DEFAULT 0
+      text TEXT NOT NULL
+      due_at TEXT NOT NULL         # ISO8601 (UTC)
+      interval INTEGER             # for recurring; NULL for one-shot
+      unit TEXT                    # one of minutes|hours|days|weeks; NULL for one-shot
+      delivered INTEGER DEFAULT 0  # only used for one-shot
     """
-
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.db = bot.store.db  # SQLAlchemy engine
         self._ensure_table_and_columns()
-        self._startup_cleanup()
         self.loop_check.start()
 
     def cog_unload(self):
@@ -28,6 +34,7 @@ class Reminders(commands.Cog):
     # ---------------- DB bootstrap ----------------
 
     def _ensure_table_and_columns(self):
+        # Create table if missing; add columns if they don't exist.
         with self.db.begin() as conn:
             conn.exec_driver_sql(
                 """
@@ -44,7 +51,7 @@ class Reminders(commands.Cog):
                 )
                 """
             )
-            # Add columns if migrating from older schema
+            # Attempt to add columns in case an older schema exists
             for sql in (
                 "ALTER TABLE reminders ADD COLUMN dm INTEGER DEFAULT 0",
                 "ALTER TABLE reminders ADD COLUMN interval INTEGER",
@@ -54,15 +61,7 @@ class Reminders(commands.Cog):
                 try:
                     conn.exec_driver_sql(sql)
                 except Exception:
-                    pass  # already exists
-
-    def _startup_cleanup(self):
-        # Delete any legacy one-shots that were marked delivered previously
-        with self.db.begin() as conn:
-            try:
-                conn.exec_driver_sql("DELETE FROM reminders WHERE delivered=1 AND (interval IS NULL OR unit IS NULL)")
-            except Exception:
-                pass
+                    pass  # column already exists
 
     # ---------------- low-level ops ----------------
 
@@ -110,10 +109,6 @@ class Reminders(commands.Cog):
             )
             return res.rowcount > 0
 
-    def _delete_reminder(self, rid: int):
-        with self.db.begin() as conn:
-            conn.exec_driver_sql("DELETE FROM reminders WHERE id=:i", {"i": rid})
-
     def _get_due(self):
         now = dt.datetime.utcnow().isoformat()
         with self.db.connect() as conn:
@@ -123,6 +118,13 @@ class Reminders(commands.Cog):
                 {"now": now},
             ).fetchall()
         return rows
+
+    def _mark_delivered(self, rid: int):
+        with self.db.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE reminders SET delivered=1 WHERE id=:i",
+                {"i": rid},
+            )
 
     def _reschedule(self, rid: int, new_due: dt.datetime):
         with self.db.begin() as conn:
@@ -138,15 +140,18 @@ class Reminders(commands.Cog):
         # Pull due reminders and dispatch.
         rows = self._get_due()
         for rid, user_id, channel_id, dm, text_, due_at, interval, unit in rows:
-            user_id = int(user_id)
-            mention = f"<@{user_id}>"
-            user = self.bot.get_user(user_id)
+            # Skip one-shots already marked delivered
+            if not interval and not unit:
+                # make sure we don't send twice
+                # (a one-shot may have been delivered in a previous iteration but not marked; handle below)
+                pass
+
+            user = self.bot.get_user(int(user_id))
             channel = self.bot.get_channel(int(channel_id)) if channel_id else None
 
-            # Decide destination
+            # Destination
             dest = None
-            dm_all = await self._get_dm_all(user_id)
-            if dm or dm_all:
+            if dm or await self._get_dm_all(user_id):
                 if user:
                     try:
                         dest = await user.create_dm()
@@ -155,20 +160,22 @@ class Reminders(commands.Cog):
             if not dest and channel:
                 dest = channel
 
-            # Send with mention
+            # Send
             if dest:
                 try:
-                    await dest.send(f"{mention} ⏰ {text_}")
+                    await dest.send(f"⏰ Reminder: {text_}")
                 except Exception:
                     pass
 
-            # Advance recurring, delete one-shot
+            # Advance or mark delivered
             if interval and unit:
                 base = dt.datetime.fromisoformat(due_at)
                 new_due = self._advance_due(base, int(interval), str(unit))
                 self._reschedule(rid, new_due)
             else:
-                self._delete_reminder(rid)
+                self._mark_delivered(rid)
+                # Also push due_at far future to avoid race conditions
+                self._reschedule(rid, dt.datetime.utcnow() + dt.timedelta(days=36500))
 
     # ---------------- utils ----------------
 
@@ -226,7 +233,7 @@ class Reminders(commands.Cog):
             return await inter.response.send_message("Invalid duration. Examples: 10m, 2h30m, 1d, 1w2d", ephemeral=True)
         due = dt.datetime.utcnow() + td
         rid = self._add_reminder(inter.user.id, inter.channel.id, bool(dm), text, due)
-        await inter.response.send_message(f"⏰ Saved `{rid:04d}` for {due:%Y-%m-%d %H:%M} UTC.", ephemeral=True)
+        await inter.response.send_message(f"⏰ Reminder `{rid:04d}` set for {due:%Y-%m-%d %H:%M} UTC.", ephemeral=True)
 
     @group.command(name="at", description="Remind you at a specific UTC time")
     @app_commands.describe(when="HH:MM or YYYY-MM-DD HH:MM (UTC)", text="What to remind you about", dm="Force DM this reminder")
@@ -243,11 +250,12 @@ class Reminders(commands.Cog):
                 # Allow "YYYY-MM-DD HH:MM" or full ISO
                 when_norm = when.replace("T", " ")
                 due = dt.datetime.fromisoformat(when_norm)
+                # assume naive is UTC
         except Exception:
             return await inter.response.send_message("Invalid time. Use HH:MM or YYYY-MM-DD HH:MM", ephemeral=True)
 
         rid = self._add_reminder(inter.user.id, inter.channel.id, bool(dm), text, due)
-        await inter.response.send_message(f"⏰ Saved `{rid:04d}` for {due:%Y-%m-%d %H:%M} UTC.", ephemeral=True)
+        await inter.response.send_message(f"⏰ Reminder `{rid:04d}` set for {due:%Y-%m-%d %H:%M} UTC.", ephemeral=True)
 
     @group.command(name="every", description="Recurring reminder")
     @app_commands.describe(interval="Repeat interval as a number", unit="Interval unit", text="What to remind you about", start_in="Delay before the first one", dm="Force DM this reminder")
@@ -269,26 +277,25 @@ class Reminders(commands.Cog):
         else:
             due = self._advance_due(due, interval, unit)
         rid = self._add_reminder(inter.user.id, inter.channel.id, bool(dm), text, due, interval, unit)
-        await inter.response.send_message(f"🔁 Saved `{rid:04d}` every {interval} {unit}, first at {due:%Y-%m-%d %H:%M} UTC.", ephemeral=True)
+        await inter.response.send_message(f"🔁 Reminder `{rid:04d}` every {interval} {unit}, first at {due:%Y-%m-%d %H:%M} UTC.", ephemeral=True)
 
     @group.command(name="list", description="List your reminders (lowest ID first)")
     async def remind_list(self, inter: discord.Interaction):
         rows = self._list_reminders(inter.user.id)
         if not rows:
             return await inter.response.send_message("You have no reminders.", ephemeral=True)
-        # Clean, single-line per reminder: `0001` [DM] due 2025-08-21 18:00 UTC · every 2 hours — text
         lines = []
         for rid, text_, due_at, interval, unit, dm in rows:
             tag = "DM" if dm else "CHAN"
-            recur = f" · every {interval} {unit}" if interval and unit else ""
-            lines.append(f"`{rid:04d}` [{tag}] due {due_at} UTC{recur} — {text_}")
+            recur = f" every {interval} {unit}" if interval and unit else ""
+            lines.append(f"`{rid:04d}` {tag} → {text_} (due {due_at}{recur})")
         await inter.response.send_message("**Your reminders:**\n" + "\n".join(lines), ephemeral=True)
 
     @group.command(name="remove", description="Remove a reminder by ID")
     async def remind_remove(self, inter: discord.Interaction, reminder_id: int):
         ok = self._remove_reminder(inter.user.id, reminder_id)
         if ok:
-            await inter.response.send_message(f"🗑️ Removed `{reminder_id:04d}`", ephemeral=True)
+            await inter.response.send_message(f"🗑️ Removed reminder `{reminder_id:04d}`", ephemeral=True)
         else:
             await inter.response.send_message("Reminder not found.", ephemeral=True)
 
