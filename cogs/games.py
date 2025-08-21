@@ -245,48 +245,58 @@ class GamesCog(commands.Cog):
                 return int(bal.credits)
         return await asyncio.to_thread(_work)
 
-@app_commands.command(name="coinflip", description="Bet on a coin flip (Heads or Tails).")
-    @app_commands.describe(choice="Your guess: Heads or Tails", bet="Bet amount in credits")
-    async def coinflip(self, inter: discord.Interaction, choice: str, bet: Optional[int] = 0):
-        choice = choice.lower()
-        if choice not in ("heads", "tails"):
-            return await inter.response.send_message("❌ Please choose `Heads` or `Tails`.", ephemeral=True)
-
+@app_commands.command(name="coinflip", description="Bet on a coin flip.")
+    @app_commands.describe(bet="Bet amount in credits")
+    @app_commands.choices(
+        choice=[
+            app_commands.Choice(name="Heads", value="heads"),
+            app_commands.Choice(name="Tails", value="tails"),
+        ]
+    )
+    async def coinflip(self, inter: discord.Interaction, choice: str, bet: int = 0):
+        # sanitize inputs
+        choice = (choice or "heads").lower()
         bet = max(0, int(bet or 0))
 
-        # check balance
+        # fetch balance and validate bet
         with self.bot.SessionLocal() as s:
             _, bal = ensure_user(s, inter.user.id)
-            if bet > bal.credits:
-                return await inter.response.send_message(
-                    f"❌ You only have **{bal.credits}** credits.", ephemeral=True
+            current = int(bal.credits)
+            if bet > current:
+                await inter.response.send_message(
+                    f"❌ You only have **{current}** credits.", ephemeral=True
                 )
+                return
 
+            # flip the coin
             outcome = random.choice(["heads", "tails"])
             win = (choice == outcome)
 
+            # settle bet
             if bet > 0:
-                if win:
-                    bal.credits += bet
-                else:
-                    bal.credits -= bet
+                delta = bet if win else -bet
+                bal.credits = current + delta
                 s.commit()
+                current = int(bal.credits)  # refresh for display
 
-            color = discord.Color.green() if win else discord.Color.red()
-            embed = discord.Embed(
-                title="🪙 Coin Flip",
-                description=f"The coin landed on **{outcome.title()}**!",
-                color=color,
-            )
-            embed.add_field(name="Your Guess", value=choice.title())
-            if bet > 0:
-                result_line = f"🏆 You won {bet} credits!" if win else f"💸 You lost {bet} credits."
-                embed.add_field(name="Result", value=result_line, inline=False)
-                embed.add_field(name="Balance", value=f"{bal.credits} credits", inline=False)
-            else:
-                embed.add_field(name="Result", value="(No bet placed)", inline=False)
+        # build a pretty embed
+        color = discord.Color.green() if win else discord.Color.red()
+        embed = discord.Embed(
+            title="🪙 Coin Flip",
+            description=f"The coin landed on **{outcome.title()}**!",
+            color=color,
+        )
+        embed.add_field(name="Your Guess", value=choice.title(), inline=True)
 
-            await inter.response.send_message(embed=embed)
+        if bet > 0:
+            result_line = f"🏆 You won **{bet}** credits!" if win else f"💸 You lost **{bet}** credits."
+            embed.add_field(name="Result", value=result_line, inline=False)
+            embed.add_field(name="Balance", value=f"{current} credits", inline=True)
+        else:
+            embed.add_field(name="Result", value="(No bet placed)", inline=False)
+
+        embed.set_footer(text="Even odds — win +bet / lose −bet")
+        await inter.response.send_message(embed=embed)
 
     @app_commands.command(name="highlow", description="Guess if next number (1-100) is higher or lower.")
     async def highlow(self, inter: discord.Interaction, guess: str):
