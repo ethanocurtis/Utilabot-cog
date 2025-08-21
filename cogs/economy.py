@@ -19,6 +19,27 @@ def utcnow() -> dt.datetime:
     return dt.datetime.utcnow().replace(tzinfo=None)
 
 
+def _parse_dt(value) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        # Normalize to naive UTC
+        if value.tzinfo is not None:
+            return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return value
+    if isinstance(value, (int, float)):
+        # unix seconds
+        return dt.datetime.utcfromtimestamp(value).replace(tzinfo=None)
+    if isinstance(value, str):
+        # try common formats
+        for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return dt.datetime.fromisoformat(value) if fmt is None else dt.datetime.strptime(value, fmt)
+            except Exception:
+                continue
+    return None
+
+
 class ShopView(discord.ui.View):
     """Interactive shop with item select, quantity select, and a Buy button."""
 
@@ -141,7 +162,7 @@ class EconomyCog(commands.Cog):
     def _get_last_claim(self, s, user_id: int) -> Optional[dt.datetime]:
         self._ensure_daily_table(s)
         row = s.execute(text("SELECT last_claim FROM daily_claims WHERE user_id = :uid"), {"uid": user_id}).fetchone()
-        return row[0] if row and row[0] else None
+        return _parse_dt(row[0]) if row else None
 
     def _set_last_claim(self, s, user_id: int, when: dt.datetime):
         self._ensure_daily_table(s)
