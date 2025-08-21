@@ -22,6 +22,7 @@ COGS = [
     "cogs.kutt",
     "cogs.reload",
     "cogs.moderation_cog",
+    "cogs.pins",
 ]
 
 class UtilaBot(commands.Bot):
