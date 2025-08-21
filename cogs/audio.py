@@ -26,6 +26,7 @@ YTDL_SEARCH_OPTS = {
     "extract_flat": "in_playlist",
     "noplaylist": True,
     "default_search": "ytsearch",
+    "socket_timeout": 2.0,
     "extractor_args": {"youtube": {"lang": [LANGUAGE]}},
 }
 
@@ -33,6 +34,7 @@ YTDL_STREAM_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
     "noplaylist": True,
+    "socket_timeout": 2.0,
     "extractor_args": {"youtube": {"lang": [LANGUAGE]}},
     "geo_bypass": True,
 }
@@ -361,11 +363,41 @@ class AudioSlash(commands.Cog):
 
     # --------------------- autocomplete ---------------------
 
-    @play.autocomplete("search")
-    async def youtube_autocomplete(self, inter: discord.Interaction, current: str):
-        current = current.strip()
-        if not current or len(current) < 3:
+    
+@play.autocomplete("search")
+async def youtube_autocomplete(self, inter: discord.Interaction, current: str):
+    current = (current or "").strip()
+    if len(current) < 3:
+        return []
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(
+                self.ytdl_search.extract_info,
+                f"ytsearch{MAX_OPTIONS}:{current}",
+                False
+            ),
+            timeout=2.3,
+        )
+        if not isinstance(results, dict):
             return []
+
+        entries = (results.get("entries") or [])[:MAX_OPTIONS]
+        choices = []
+        for e in entries:
+            if not e:
+                continue
+            name = _format_choice_title(e)[:100]
+            value = (e.get("webpage_url") or e.get("url") or "").strip()
+            if not value:
+                continue
+            choices.append(app_commands.Choice(name=name, value=value[:100]))
+        return choices
+    except asyncio.TimeoutError:
+        return []
+    except Exception:
+        log.exception("Autocomplete error")
+        return [app_commands.Choice(name="Autocomplete error. Keep typing…", value=current[:100])]
         try:
             results = await asyncio.to_thread(
                 self.ytdl_search.extract_info, f"ytsearch{MAX_OPTIONS}:{current}", download=False
