@@ -1,11 +1,14 @@
 
 # cogs/moderation.py
 import re
+import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+
 
 def _has_guild_admin_perms(inter: discord.Interaction) -> bool:
     try:
@@ -19,22 +22,25 @@ def _has_guild_admin_perms(inter: discord.Interaction) -> bool:
 
 class Moderation(commands.Cog):
     """
-    Moderation utilities: /purge and auto-delete controls, in cog style.
+    Moderation utilities: /purge and auto-delete controls, plus the actual
+    deletion runtime (per-message for <60s and periodic sweep for >=60s).
 
-    This cog tries to use your global `store` (from your main bot) if present,
-    so allowlist checks and autodelete persistence match your Utilabot behavior.
-    To enable that, set `bot.store = store` in your main after initializing the Store.
+    This cog tries to use your global `bot.store` if present. It supports either:
+      - Store with get/set/remove_autodelete()
+      - WxStore-style config with set_config/get_config/delete_config (and optional get_config_all())
     """
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # If your main sets `bot.store = store`, we'll reuse it.
         self.store = getattr(bot, "store", None)
+        # start periodic sweeper once bot is ready
+        if not getattr(self, "_sweeper_started", False):
+            self.cleanup_loop.start()
+            self._sweeper_started = True
 
     # ---------- helpers ----------
     def _is_admin_or_allowlisted(self, inter: discord.Interaction) -> bool:
         if _has_guild_admin_perms(inter):
             return True
-        # Optional allowlist via your existing Store
         try:
             if self.store and hasattr(self.store, "is_allowlisted"):
                 return bool(self.store.is_allowlisted(inter.user.id))
@@ -55,10 +61,8 @@ class Moderation(commands.Cog):
     def _ad_set(self, channel_id: int, seconds: int) -> None:
         if not self.store:
             raise RuntimeError("No store attached")
-        # Preferred: dedicated methods
         if hasattr(self.store, "set_autodelete"):
             return self.store.set_autodelete(int(channel_id), int(seconds))
-        # Fallback: config-style store (WxStore)
         if hasattr(self.store, "set_config"):
             return self.store.set_config(self._ad_key(channel_id), int(seconds))
         raise AttributeError("Store missing set_autodelete and set_config")
@@ -73,18 +77,14 @@ class Moderation(commands.Cog):
         raise AttributeError("Store missing remove_autodelete and delete_config")
 
     def _ad_get_map(self) -> Dict[str, int]:
-        """
-        Returns {channel_id_str: seconds}
-        """
+        """Returns {channel_id_str: seconds}."""
         if not self.store:
             return {}
-        # Dedicated table
         if hasattr(self.store, "get_autodelete"):
             try:
-                return dict(self.store.get_autodelete() or {})
+                return {str(k): int(v) for k, v in (self.store.get_autodelete() or {}).items()}
             except Exception:
                 pass
-        # Config table: require get_config_all to list
         if hasattr(self.store, "get_config_all"):
             try:
                 raw = self.store.get_config_all() or {}
@@ -99,20 +99,15 @@ class Moderation(commands.Cog):
                 return out
             except Exception:
                 pass
-        # Best-effort: no way to list all; return empty and rely on status per channel
         return {}
 
     def _ad_get_for_channel(self, channel_id: int) -> int:
-        """
-        Returns seconds for channel or 0 if off, even for stores without listing.
-        """
+        """Returns seconds for channel or 0 if off, even for stores without listing."""
         if not self.store:
             return 0
-        # Direct map if available
         m = self._ad_get_map()
         if m:
             return int(m.get(str(int(channel_id)), 0))
-        # Try single-key read on config stores
         if hasattr(self.store, "get_config"):
             try:
                 v = self.store.get_config(self._ad_key(channel_id))
@@ -194,7 +189,6 @@ class Moderation(commands.Cog):
             ad_map = self._ad_get_map()
             if not ad_map:
                 return await inter.response.send_message("No channels have auto-delete configured.", ephemeral=True)
-            # Try to resolve channel names in this guild only
             lines = []
             for cid, secs in ad_map.items():
                 channel = inter.guild.get_channel(int(cid)) if inter.guild else None
@@ -242,6 +236,82 @@ class Moderation(commands.Cog):
             return await inter.response.send_message(
                 f"🗑️ Auto-delete enabled: older than **{self._pretty_seconds(seconds)}**.", ephemeral=True
             )
+
+    # ---------- deletion runtime ----------
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Skip system/DMs
+        if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+            return
+        # Bot perms needed
+        try:
+            perms = message.channel.permissions_for(message.guild.me) if message.guild else None
+            if not perms or not perms.manage_messages:
+                return
+        except Exception:
+            return
+        try:
+            secs = self._ad_get_for_channel(message.channel.id)
+            if secs and secs < 60:
+                # schedule per-message delete
+                asyncio.create_task(self._schedule_autodelete(message, secs))
+        except Exception:
+            pass
+
+    async def _schedule_autodelete(self, message: discord.Message, seconds: int):
+        try:
+            await asyncio.sleep(max(1, int(seconds)))
+            # re-fetch and respect pins
+            try:
+                msg = await message.channel.fetch_message(message.id)
+            except Exception:
+                return
+            if getattr(msg, "pinned", False):
+                return
+            await msg.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        except Exception:
+            pass
+
+    @tasks.loop(minutes=2)
+    async def cleanup_loop(self):
+        try:
+            conf = self._ad_get_map()
+            if not conf:
+                return
+            now = datetime.now(timezone.utc)
+            for chan_id, secs in list(conf.items()):
+                if secs < 60:
+                    continue  # handled per-message
+                channel = self.bot.get_channel(int(chan_id))
+                if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    continue
+                try:
+                    perms = channel.permissions_for(channel.guild.me) if getattr(channel, "guild", None) else None
+                    if not perms or not perms.manage_messages or not perms.read_message_history:
+                        continue
+                except Exception:
+                    continue
+                cutoff = now - timedelta(seconds=int(secs))
+                try:
+                    # delete messages older than cutoff (skip pinned)
+                    async for m in channel.history(limit=200, before=None, oldest_first=False):
+                        if getattr(m, "pinned", False):
+                            continue
+                        if m.created_at and m.created_at.replace(tzinfo=timezone.utc) <= cutoff:
+                            try:
+                                await m.delete()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @cleanup_loop.before_loop
+    async def _before_cleanup(self):
+        await self.bot.wait_until_ready()
 
     # ---------- helpers ----------
     @staticmethod
