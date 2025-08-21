@@ -1,23 +1,27 @@
+
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 from sqlalchemy import text
 
-
 class WxStore:
     """
-    Minimal storage adapter for the weather cog.
-
-    Tables expected in DB:
+    Minimal storage adapter for weather + global KV used by other cogs.
+    This uses your existing tables:
       - weather_zips(user_id INTEGER PRIMARY KEY, zip TEXT)
       - weather_subscriptions(id INTEGER PRIMARY KEY AUTOINCREMENT,
                               user_id INTEGER, zip TEXT, cadence TEXT,
                               hh INTEGER, mi INTEGER, weekly_days INTEGER,
                               next_run_utc TEXT)
-      - notes(user_id INTEGER, k TEXT, v TEXT, PRIMARY KEY(user_id, k))
+      - user_notes_kv(user_id INTEGER, k TEXT, v TEXT, PRIMARY KEY(user_id, k))
+      - notes(user_id INTEGER, k TEXT, v TEXT, PRIMARY KEY(user_id, k)) [optional, per-user notes only]
     """
+
+    # Reserve user_id=0 inside user_notes_kv for global config
+    CONFIG_USER: int = 0
+
     def __init__(self, engine):
         self.engine = engine
-        # Some code in the cog calls self.store.db.execute(...)
+        # Some code in cogs may call self.store.db.execute(...)
         self.db = engine
 
     # ---- ZIP ----
@@ -108,21 +112,32 @@ class WxStore:
             )
             return res.rowcount > 0  # type: ignore[attr-defined]
 
-    # ---- Notes (generic key/value per *user*) ----
+    # ---- Per-user notes (if you use them elsewhere) ----
     def get_note(self, user_id: int, key: str) -> Optional[str]:
+        # Prefer user_notes_kv if present; fall back to notes table if needed
         with self.engine.connect() as c:
             row = c.execute(
-                text("SELECT v FROM notes WHERE user_id=:u AND k=:k"),
+                text("SELECT v FROM user_notes_kv WHERE user_id=:u AND k=:k"),
                 {"u": user_id, "k": key},
             ).fetchone()
-            return row[0] if row else None
+            if row:
+                return row[0]
+            # optional fallback
+            try:
+                row2 = c.execute(
+                    text("SELECT v FROM notes WHERE user_id=:u AND k=:k"),
+                    {"u": user_id, "k": key},
+                ).fetchone()
+                return row2[0] if row2 else None
+            except Exception:
+                return None
 
     def set_note(self, user_id: int, key: str, value: str) -> None:
         with self.engine.begin() as c:
             c.execute(
                 text(
                     """
-                    INSERT INTO notes(user_id, k, v)
+                    INSERT INTO user_notes_kv(user_id, k, v)
                     VALUES (:u, :k, :v)
                     ON CONFLICT(user_id, k) DO UPDATE SET v=excluded.v
                     """
@@ -130,15 +145,13 @@ class WxStore:
                 {"u": user_id, "k": key, "v": value},
             )
 
-    # ---- Global config (stored in notes with user_id=0) ----
-    CONFIG_USER: int = 0  # reserve user_id=0 for global KV
-
+    # ---- Global config (stored in user_notes_kv with user_id=0) ----
     def set_config(self, key: str, value) -> None:
         with self.engine.begin() as c:
             c.execute(
                 text(
                     """
-                    INSERT INTO notes(user_id, k, v)
+                    INSERT INTO user_notes_kv(user_id, k, v)
                     VALUES (:u, :k, :v)
                     ON CONFLICT(user_id, k) DO UPDATE SET v=excluded.v
                     """
@@ -149,7 +162,7 @@ class WxStore:
     def get_config(self, key: str) -> Optional[str]:
         with self.engine.connect() as c:
             row = c.execute(
-                text("SELECT v FROM notes WHERE user_id=:u AND k=:k"),
+                text("SELECT v FROM user_notes_kv WHERE user_id=:u AND k=:k"),
                 {"u": self.CONFIG_USER, "k": str(key)},
             ).fetchone()
             return row[0] if row else None
@@ -157,14 +170,14 @@ class WxStore:
     def delete_config(self, key: str) -> None:
         with self.engine.begin() as c:
             c.execute(
-                text("DELETE FROM notes WHERE user_id=:u AND k=:k"),
+                text("DELETE FROM user_notes_kv WHERE user_id=:u AND k=:k"),
                 {"u": self.CONFIG_USER, "k": str(key)},
             )
 
     def get_config_all(self) -> Dict[str, str]:
         with self.engine.connect() as c:
             rows = c.execute(
-                text("SELECT k, v FROM notes WHERE user_id=:u"),
+                text("SELECT k, v FROM user_notes_kv WHERE user_id=:u"),
                 {"u": self.CONFIG_USER},
             ).fetchall()
         return {str(k): str(v) for (k, v) in rows}
