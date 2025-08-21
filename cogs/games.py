@@ -311,6 +311,79 @@ class CoinflipView(discord.ui.View):
         else:
             await self._animate_and_resolve(edit_resp=interaction.edit_original_response)
 
+#-----high low view-----
+class HighLowView(discord.ui.View):
+    def __init__(self, *, player: discord.Member, base: int, bet: int, apply_credit: Callable[[int, int], "asyncio.Future"], timeout: int = 30):
+        super().__init__(timeout=timeout)
+        self.player = player
+        self.base = int(base)
+        self.bet = max(0, int(bet or 0))
+        self.apply_credit = apply_credit
+        self.message: Optional[discord.Message] = None
+        self.finished = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.player.id:
+            await interaction.response.send_message("Only the game owner can use these buttons.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        if self.message and not self.finished:
+            for c in self.children:
+                c.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+    async def _resolve(self, interaction: discord.Interaction, guess: str):
+        self.finished = True
+        for c in self.children:
+            c.disabled = True
+
+        # reveal next number (1..100)
+        nxt = random.randint(1, 100)
+        actual = "higher" if nxt > self.base else ("lower" if nxt < self.base else "equal")
+        win = (guess == actual)
+
+        # settle bet (even odds)
+        result_line = "(No bet placed)"
+        new_balance_display = None
+        if self.bet > 0:
+            delta = self.bet if win else -self.bet
+            new_balance = await self.apply_credit(self.player.id, delta)
+            result_line = f"🏆 You won **{self.bet}** credits!" if win else f"💸 You lost **{self.bet}** credits."
+            new_balance_display = f"{new_balance} credits"
+
+        color = discord.Color.green() if win else discord.Color.red()
+        embed = discord.Embed(title="🔺 High / 🔻 Low", color=color)
+        embed.add_field(name="Base", value=f"**{self.base}**", inline=True)
+        embed.add_field(name="Your Guess", value=guess.title(), inline=True)
+        embed.add_field(name="Next", value=f"**{nxt}** ({actual})", inline=True)
+
+        if self.bet > 0:
+            embed.add_field(name="Result", value=result_line, inline=False)
+            embed.add_field(name="Bet", value=f"{self.bet} credits", inline=True)
+            embed.add_field(name="Balance", value=new_balance_display, inline=True)
+        else:
+            embed.add_field(name="Result", value=result_line, inline=False)
+
+        embed.set_footer(text="Even odds — win +bet / lose −bet")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Higher", style=discord.ButtonStyle.success, emoji="🔺")
+    async def btn_higher(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "higher")
+
+    @discord.ui.button(label="Equal", style=discord.ButtonStyle.secondary, emoji="➖")
+    async def btn_equal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "equal")
+
+    @discord.ui.button(label="Lower", style=discord.ButtonStyle.danger, emoji="🔻")
+    async def btn_lower(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "lower")
+
 
 # ---------------- Games Cog ----------------
 
@@ -404,14 +477,32 @@ class GamesCog(commands.Cog):
 
     # --------- Small extras (no credits) ---------
 
-    @app_commands.command(name="highlow", description="Guess if next number (1-100) is higher or lower.")
-    async def highlow(self, inter: discord.Interaction, guess: str):
+    @app_commands.command(name="highlow", description="Guess if the next number (1–100) is higher, lower, or equal. Betting supported.")
+    @app_commands.describe(bet="Bet amount in credits (default 0)")
+    async def highlow(self, inter: discord.Interaction, bet: Optional[int] = 0):
+        bet = max(0, int(bet or 0))
+
+        # validate bet vs balance (uses your economy DB)
+        with self.bot.SessionLocal() as s:
+            _, bal = ensure_user(s, inter.user.id)
+            current = int(bal.credits)
+            if bet > current:
+                return await inter.response.send_message(
+                    f"❌ You only have **{current}** credits.", ephemeral=True
+                )
+
+        # roll the base number and show it before the guess
         base = random.randint(1, 100)
-        nxt = random.randint(1, 100)
-        res = "higher" if nxt > base else ("lower" if nxt < base else "equal")
-        win = (guess.lower().startswith(res[:1])) or (res == "equal" and guess.lower().startswith("e"))
-        outcome = "✅ Correct!" if win else "❌ Nope."
-        await inter.response.send_message(f"Base: **{base}** → Next: **{nxt}** ({res}). {outcome}")
+        view = HighLowView(player=inter.user, base=base, bet=bet, apply_credit=self._apply_credit, timeout=30)
+
+        embed = discord.Embed(title="🔺 High / 🔻 Low", color=discord.Color.blurple())
+        embed.add_field(name="Base", value=f"**{base}**", inline=True)
+        if bet > 0:
+            embed.add_field(name="Bet", value=f"{bet} credits", inline=True)
+        embed.set_footer(text="Pick Higher, Lower, or Equal")
+
+        await inter.response.send_message(embed=embed, view=view)
+        view.message = await inter.original_response()
 
     @app_commands.command(name="trivia", description="Quick trivia (True/False).")
     async def trivia(self, inter: discord.Interaction):
