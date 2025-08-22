@@ -4,7 +4,7 @@ import re
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict
-from cogs.admin_gate import gated
+from cogs.admin_gates import gated
 
 
 import discord
