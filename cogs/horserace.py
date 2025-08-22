@@ -18,19 +18,31 @@ from utils.common import ensure_user  # type: ignore
 # Utility: DB helpers
 # ------------------------------
 
+def _find_balance_field(bal) -> str:
+    for name in ("amount", "balance", "credits", "coins", "value"):
+        if hasattr(bal, name):
+            return name
+    # default fallback
+    return "amount"
+
 def _get_balance(session, user_id: int) -> int:
     bal = session.query(Balance).filter_by(user_id=user_id).one_or_none()
-    return int(bal.amount) if bal else 0
+    if not bal:
+        return 0
+    field = _find_balance_field(bal)
+    return int(getattr(bal, field) or 0)
 
 def _add_balance(session, user_id: int, delta: int) -> int:
     bal = session.query(Balance).filter_by(user_id=user_id).one_or_none()
     if not bal:
-        bal = Balance(user_id=user_id, amount=0)
+        bal = Balance(user_id=user_id)
         session.add(bal)
         session.flush()
-    bal.amount = int(bal.amount) + int(delta)
+    field = _find_balance_field(bal)
+    current = int(getattr(bal, field) or 0)
+    setattr(bal, field, current + int(delta))
     session.commit()
-    return int(bal.amount)
+    return int(getattr(bal, field))
 
 def _can_afford(session, user_id: int, amount: int) -> bool:
     return _get_balance(session, user_id) >= amount
