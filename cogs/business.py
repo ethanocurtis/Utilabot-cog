@@ -1,7 +1,7 @@
 # cogs/business.py
 from __future__ import annotations
 import datetime as dt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import discord
 from discord.ext import commands, tasks
@@ -286,6 +286,13 @@ class UpgradeView(discord.ui.View):
         self.add_item(BusinessUpgradeSelect(bot, rows))
 
 
+# ---------- Admin helpers ----------
+
+def _is_admin(inter: discord.Interaction) -> bool:
+    """Basic admin check — adjust to your needs (roles, IDs, etc.)."""
+    return bool(inter.guild and inter.user.guild_permissions.manage_guild)
+
+
 # ---------- Cog ----------
 
 class BusinessCog(commands.Cog):
@@ -298,6 +305,75 @@ class BusinessCog(commands.Cog):
     def cog_unload(self):
         if self._payout_task.is_running():
             self._payout_task.cancel()
+
+    # ----- Autocomplete for business name -----
+    async def _business_name_autocomplete(
+        self,
+        inter: discord.Interaction,
+        current: str
+    ) -> List[app_commands.Choice[str]]:
+        with self.bot.SessionLocal() as s:
+            q = s.query(Business).order_by(Business.name.asc())
+            if current:
+                # case-insensitive contains
+                q = q.filter(Business.name.ilike(f"%{current}%"))
+            rows = q.limit(25).all()
+        return [app_commands.Choice(name=b.name, value=b.name) for b in rows]
+
+    # ----- Admin commands -----
+
+    @app_commands.command(name="business_set_price", description="(Admin) Set the purchase price of a business.")
+    @app_commands.describe(name="Business name", new_cost="New purchase price (credits)")
+    @app_commands.autocomplete(name=_business_name_autocomplete)
+    async def business_set_price(self, inter: discord.Interaction, name: str, new_cost: int):
+        if not _is_admin(inter):
+            return await inter.response.send_message("Admins only.", ephemeral=True)
+        if new_cost < 0:
+            return await inter.response.send_message("Cost must be ≥ 0.", ephemeral=True)
+        with self.bot.SessionLocal() as s:
+            biz = s.query(Business).filter(Business.name.ilike(name)).first()
+            if not biz:
+                return await inter.response.send_message("Business not found.", ephemeral=True)
+            old = biz.cost
+            biz.cost = int(new_cost)
+            s.commit()
+        await inter.response.send_message(
+            f"✅ Updated **{biz.name}** cost: **{old} → {biz.cost}**.",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="business_set_yield", description="(Admin) Set the base hourly yield of a business.")
+    @app_commands.describe(name="Business name", new_yield="New base hourly yield")
+    @app_commands.autocomplete(name=_business_name_autocomplete)
+    async def business_set_yield(self, inter: discord.Interaction, name: str, new_yield: int):
+        if not _is_admin(inter):
+            return await inter.response.send_message("Admins only.", ephemeral=True)
+        if new_yield < 0:
+            return await inter.response.send_message("Yield must be ≥ 0.", ephemeral=True)
+        with self.bot.SessionLocal() as s:
+            biz = s.query(Business).filter(Business.name.ilike(name)).first()
+            if not biz:
+                return await inter.response.send_message("Business not found.", ephemeral=True)
+            old = biz.hourly_yield
+            biz.hourly_yield = int(new_yield)
+            s.commit()
+        await inter.response.send_message(
+            f"✅ Updated **{biz.name}** yield: **{old}/hr → {biz.hourly_yield}/hr**.",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="business_list", description="(Admin) List all businesses with cost & yield.")
+    async def business_list(self, inter: discord.Interaction):
+        if not _is_admin(inter):
+            return await inter.response.send_message("Admins only.", ephemeral=True)
+        with self.bot.SessionLocal() as s:
+            rows = s.query(Business).order_by(Business.cost.asc()).all()
+        if not rows:
+            return await inter.response.send_message("No businesses found.", ephemeral=True)
+        lines = [f"- **{b.name}** — cost {b.cost}, yield {b.hourly_yield}/hr" for b in rows]
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ----- User commands -----
 
     @app_commands.command(name="business_catalog", description="Browse available businesses.")
     async def business_catalog(self, inter: discord.Interaction):
