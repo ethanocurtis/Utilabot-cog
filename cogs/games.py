@@ -994,7 +994,15 @@ async def _hr_horserace_impl(self: GamesCog, inter: discord.Interaction, min_bet
 
 
 
-# Register horserace as an app command on the GamesCog class
-GamesCog.horserace = app_commands.command(name="horserace", description="Create a multiplayer horse race with betting and animations.")(_hr_horserace_impl)
+
+# Properly register horserace as a Cog method to avoid Interaction being treated as an option
+async def horserace(self, inter: discord.Interaction, min_bet: int = 50, max_bet: int = 0, max_players: int = 6, join_seconds: int = 45):
+    return await _hr_horserace_impl(self, inter, min_bet, max_bet, max_players, join_seconds)
+
+GamesCog.horserace = app_commands.command(
+    name="horserace",
+    description="Create a multiplayer horse race with betting and animations."
+)(horserace)
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(GamesCog(bot))
