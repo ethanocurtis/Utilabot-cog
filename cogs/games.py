@@ -417,14 +417,14 @@ class GamesCog(commands.Cog):
     # --------- Coinflip (animated + Reflip) ---------
 
     @app_commands.command(name="coinflip", description="Bet on a coin flip.")
-    @app_commands.describe(bet="Bet amount in credits")
+    @app_commands.describe(bet="Bet amount in credits", side="Your guess: heads or tails")
     @app_commands.choices(
-        choice=[
+        side=[
             app_commands.Choice(name="Heads", value="heads"),
             app_commands.Choice(name="Tails", value="tails"),
         ]
     )
-    async def coinflip(self, inter: discord.Interaction, choice: str, bet: int = 0):
+    async def coinflip(self, inter: discord.Interaction, side: str, bet: int = 0):
         # Validate bet vs current balance
         with self.bot.SessionLocal() as s:
             _, bal = ensure_user(s, inter.user.id)
@@ -437,13 +437,13 @@ class GamesCog(commands.Cog):
                 )
 
         # Send initial message with spinner frame, attach view, then animate
-        view = CoinflipView(bot=self.bot, player=inter.user, bet=bet, choice=choice, timeout=30)
+        view = CoinflipView(bot=self.bot, player=inter.user, bet=bet, choice=side, timeout=30)
         embed = discord.Embed(
             title="🪙 Coin Flip",
             description="🪙 Flipping…",
             color=discord.Color.blurple(),
         )
-        embed.add_field(name="Your Guess", value=choice.title(), inline=True)
+        embed.add_field(name="Your Guess", value=side.title(), inline=True)
         if bet > 0:
             embed.add_field(name="Bet", value=f"{bet} credits", inline=True)
         await inter.response.send_message(embed=embed, view=view)
