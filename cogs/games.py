@@ -387,6 +387,116 @@ class HighLowView(discord.ui.View):
 
 # ---------------- Games Cog ----------------
 
+
+# ---------------- Horse Racing (animated, multiplayer betting) ----------------
+import asyncio as _asyncio_hr
+import random as _random_hr
+from dataclasses import dataclass as _hr_dataclass, field as _hr_field
+
+HR_TRACK_LENGTH = 26
+HR_TICK_SECONDS = 1.1
+HR_JOIN_EDIT_EVERY = 5
+HR_EMOJIS = ["🐎", "🐴", "🦄", "🐆", "🦓", "🐢"]
+HR_FLAG = "🏁"
+HR_MEDALS = ["🥇", "🥈", "🥉", "🏅"]
+
+def _hr_bar(pos: int, total: int) -> str:
+    pos = max(0, min(pos, total))
+    return "▰" * pos + "▱" * (total - pos)
+
+@_hr_dataclass
+class HRRacer:
+    user_id: int
+    display: str
+    emoji: str
+    bet: int
+    pos: int = 0
+    boosted: bool = False
+
+@_hr_dataclass
+class HRState:
+    guild_id: int
+    channel_id: int
+    host_id: int
+    min_bet: int
+    max_bet: int
+    max_players: int
+    join_seconds: int
+    message_id: int | None = None
+    lobby_open: bool = True
+    racers: dict[int, HRRacer] = _hr_field(default_factory=dict)
+    pot: int = 0
+    running: bool = False
+    finished: bool = False
+    winners: list[int] = _hr_field(default_factory=list)
+
+class HRBetModal(discord.ui.Modal, title="Join Horse Race"):
+    bet_amount = discord.ui.TextInput(
+        label="Your bet amount",
+        style=discord.TextStyle.short,
+        placeholder="e.g., 250",
+        required=True,
+        min_length=1,
+        max_length=12,
+    )
+    def __init__(self, cog: "GamesCog", state: HRState):
+        super().__init__()
+        self.cog = cog
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not self.state.lobby_open:
+            return await interaction.response.send_message("Lobby is closed.", ephemeral=True)
+        try:
+            amt = int(str(self.bet_amount).strip().replace(",", ""))
+        except ValueError:
+            return await interaction.response.send_message("Enter a valid whole number.", ephemeral=True)
+        if amt < self.state.min_bet:
+            return await interaction.response.send_message(f"Minimum bet is {self.state.min_bet:,}.", ephemeral=True)
+        if self.state.max_bet and amt > self.state.max_bet:
+            return await interaction.response.send_message(f"Maximum bet is {self.state.max_bet:,}.", ephemeral=True)
+        if len(self.state.racers) >= self.state.max_players and interaction.user.id not in self.state.racers:
+            return await interaction.response.send_message("This lobby is full.", ephemeral=True)
+
+        # Use existing helpers
+        bal = await self.cog._get_balance(interaction.user.id)
+        if amt > bal:
+            return await interaction.response.send_message(f"❌ You only have **{bal}** credits.", ephemeral=True)
+        await self.cog._apply_credit(interaction.user.id, -amt)  # debit immediately
+
+        emoji = HR_EMOJIS[len(self.state.racers) % len(HR_EMOJIS)]
+        self.state.racers[interaction.user.id] = HRRacer(
+            user_id=interaction.user.id,
+            display=interaction.user.display_name,
+            emoji=emoji,
+            bet=amt,
+        )
+        self.state.pot = sum(r.bet for r in self.state.racers.values())
+
+        await interaction.response.send_message(
+            f"You're in for **{amt:,}**. Good luck, {interaction.user.mention}! {emoji}", ephemeral=True
+        )
+
+class HRBoost(discord.ui.Button):
+    def __init__(self, state: HRState):
+        super().__init__(label="Boost!", style=discord.ButtonStyle.primary, emoji="💨")
+        self.state = state
+    async def callback(self, interaction: discord.Interaction):
+        if not self.state.running or self.state.finished:
+            return await interaction.response.send_message("Race is not running.", ephemeral=True)
+        r = self.state.racers.get(interaction.user.id)
+        if not r:
+            return await interaction.response.send_message("You're not in this race.", ephemeral=True)
+        if r.boosted:
+            return await interaction.response.send_message("You've already used your boost.", ephemeral=True)
+        r.boosted = True
+        r.pos = min(HR_TRACK_LENGTH, r.pos + _random_hr.randint(1, 2))
+        await interaction.response.send_message("You hit the turbo! 💥", ephemeral=True)
+
+class HRRaceView(discord.ui.View):
+    def __init__(self, state: HRState):
+        super().__init__(timeout=None)
+        self.add_item(HRBoost(state))
 class GamesCog(commands.Cog):
     """
     Games cog that integrates with your economy DB (via bot.SessionLocal + ensure_user).
@@ -452,170 +562,6 @@ class GamesCog(commands.Cog):
         # animate and resolve the first flip
         await view._animate_and_resolve(edit_resp=view.message.edit)
 
-    # ---------------- Horse Racing (multiplayer, animated, betting) ----------------
-
-from dataclasses import dataclass, field
-
-TRACK_LENGTH = 26
-TICK_SECONDS = 1.1
-JOIN_COUNTDOWN_EDIT_EVERY = 5
-EMOJIS = ["🐎", "🐴", "🦄", "🐆", "🦓", "🐢"]
-FINISH_FLAG = "🏁"
-MEDALS = ["🥇", "🥈", "🥉", "🏅"]
-
-def _hr_progress_bar(pos: int, total: int) -> str:
-    pos = max(0, min(pos, total))
-    return "▰" * pos + "▱" * (total - pos)
-
-@dataclass
-class HRRacer:
-    user_id: int
-    display: str
-    emoji: str
-    bet: int
-    pos: int = 0
-    boosted: bool = False
-
-@dataclass
-class HRState:
-    guild_id: int
-    channel_id: int
-    host_id: int
-    min_bet: int
-    max_bet: int
-    max_players: int
-    join_seconds: int
-    message_id: int | None = None
-    lobby_open: bool = True
-    racers: dict[int, HRRacer] = field(default_factory=dict)
-    pot: int = 0
-    running: bool = False
-    finished: bool = False
-    winners: list[int] = field(default_factory=list)
-
-class HRBetModal(discord.ui.Modal, title="Join Horse Race"):
-    bet_amount = discord.ui.TextInput(
-        label="Your bet amount",
-        style=discord.TextStyle.short,
-        placeholder="e.g., 250",
-        required=True,
-    )
-    def __init__(self, cog: "GamesCog", state: HRState):
-        super().__init__()
-        self.cog = cog
-        self.state = state
-    async def on_submit(self, interaction: discord.Interaction):
-        if not self.state.lobby_open:
-            return await interaction.response.send_message("Lobby closed.", ephemeral=True)
-        try:
-            amt = int(str(self.bet_amount).replace(",", ""))
-        except ValueError:
-            return await interaction.response.send_message("Enter a valid number.", ephemeral=True)
-        if amt < self.state.min_bet:
-            return await interaction.response.send_message(f"Minimum bet is {self.state.min_bet}", ephemeral=True)
-        if self.state.max_bet and amt > self.state.max_bet:
-            return await interaction.response.send_message(f"Maximum bet is {self.state.max_bet}", ephemeral=True)
-        bal = await self.cog._get_balance(interaction.user.id)
-        if amt > bal:
-            return await interaction.response.send_message(f"❌ You only have {bal} credits.", ephemeral=True)
-        await self.cog._apply_credit(interaction.user.id, -amt)
-        emoji = EMOJIS[len(self.state.racers) % len(EMOJIS)]
-        self.state.racers[interaction.user.id] = HRRacer(interaction.user.id, interaction.user.display_name, emoji, amt)
-        self.state.pot = sum(r.bet for r in self.state.racers.values())
-        await interaction.response.send_message(f"✅ Bet **{amt}** placed!", ephemeral=True)
-
-class HRBoost(discord.ui.Button):
-    def __init__(self, state: HRState):
-        super().__init__(label="Boost!", style=discord.ButtonStyle.primary, emoji="💨")
-        self.state = state
-    async def callback(self, interaction: discord.Interaction):
-        r = self.state.racers.get(interaction.user.id)
-        if not r:
-            return await interaction.response.send_message("Not in this race.", ephemeral=True)
-        if r.boosted:
-            return await interaction.response.send_message("You already boosted.", ephemeral=True)
-        r.boosted = True
-        r.pos = min(TRACK_LENGTH, r.pos + random.randint(1, 2))
-        await interaction.response.send_message("💥 Turbo!", ephemeral=True)
-
-class HRRaceView(discord.ui.View):
-    def __init__(self, state: HRState):
-        super().__init__(timeout=None)
-        self.add_item(HRBoost(state))
-
-# ---- GamesCog horse race methods ----
-class GamesCog(commands.Cog):
-    ...
-
-    @app_commands.command(name="horserace", description="Start a multiplayer horse race with betting.")
-    async def horserace(self, inter: discord.Interaction, min_bet: int = 50, max_bet: int = 0, max_players: int = 6, join_seconds: int = 45):
-        state = HRState(inter.guild.id, inter.channel_id, inter.user.id, min_bet, max_bet, max_players, join_seconds)
-        emb = self._hr_render_lobby(state)
-        view = discord.ui.View()
-        join_btn = discord.ui.Button(label="Join", style=discord.ButtonStyle.success, emoji="➕")
-        async def _join_cb(i: discord.Interaction): await i.response.send_modal(HRBetModal(self, state))
-        join_btn.callback = _join_cb
-        view.add_item(join_btn)
-        await inter.response.send_message(embed=emb, view=view)
-        msg = await inter.original_response()
-        state.message_id = msg.id
-
-        # countdown
-        for remaining in range(join_seconds, 0, -1):
-            if not state.lobby_open: break
-            if remaining % 5 == 0 or remaining <= 5:
-                await msg.edit(embed=self._hr_render_lobby(state, remaining))
-            await asyncio.sleep(1)
-
-        # auto start/solo/cancel
-        if len(state.racers) >= 2:
-            await msg.edit(embed=self._hr_render_race(state, prestart=True), view=HRRaceView(state))
-            await self._hr_run(state, msg)
-        elif len(state.racers) == 1:
-            lone = next(iter(state.racers.values()))
-            await msg.edit(embed=discord.Embed(title="🏇 Solo Run", description=f"{lone.display} races alone! Profit!"), view=HRRaceView(state))
-            await self._hr_run(state, msg, solo=True)
-        else:
-            await msg.edit(embed=discord.Embed(title="No players joined.", color=discord.Color.red()), view=None)
-
-    # --- helpers ---
-    def _hr_render_lobby(self, state: HRState, remaining: int | None = None):
-        desc = f"**Pot:** {state.pot}\n"
-        if remaining: desc += f"⏳ {remaining}s left"
-        emb = discord.Embed(title="🏇 Horse Race — Lobby", description=desc, color=discord.Color.blurple())
-        if state.racers:
-            emb.add_field(name="Players", value="\n".join(f"{r.emoji} {r.display} — {r.bet}" for r in state.racers.values()), inline=False)
-        return emb
-    def _hr_render_race(self, state: HRState, prestart=False):
-        emb = discord.Embed(title="🏇 Horse Race", color=discord.Color.green())
-        lines = []
-        for r in state.racers.values():
-            bar = _hr_progress_bar(r.pos, TRACK_LENGTH)
-            lines.append(f"{r.emoji} {r.display}\n`{bar}` {FINISH_FLAG}")
-        emb.description = "\n".join(lines)
-        return emb
-    async def _hr_run(self, state: HRState, msg: discord.Message, solo=False):
-        order = list(state.racers.keys())
-        while not state.finished:
-            for uid in order:
-                r = state.racers[uid]
-                r.pos = min(TRACK_LENGTH, r.pos + random.randint(0, 3))
-            leaders = [r for r in state.racers.values() if r.pos >= TRACK_LENGTH]
-            if leaders:
-                state.finished = True
-                state.winners = [leaders[0].user_id]
-            await msg.edit(embed=self._hr_render_race(state), view=HRRaceView(state) if not state.finished else None)
-            await asyncio.sleep(TICK_SECONDS)
-        # payout
-        if solo:
-            lone = next(iter(state.racers.values()))
-            await self._apply_credit(lone.user_id, lone.bet * 2)  # net profit
-        else:
-            pot = sum(r.bet for r in state.racers.values())
-            win = state.racers[state.winners[0]]
-            await self._apply_credit(win.user_id, pot)
-        await msg.edit(embed=discord.Embed(title="🏁 Finished!", description="Race over!"), view=None)
-    
     # --------- Blackjack ---------
 
     @app_commands.command(name="blackjack", description="Play blackjack vs. dealer with optional bet.")
@@ -687,5 +633,175 @@ class GamesCog(commands.Cog):
         correct = "true" if q[1] else "false"
         await inter.followup.send("✅ Correct!" if m.content.lower() == correct else f"❌ Nope. Correct is **{correct}**.")
 
+
+# ---------- Horse Race: renderers ----------
+def _hr_render_lobby(self, state: HRState, remaining: int | None = None) -> discord.Embed:
+    desc = (
+        f"**Host:** <@{state.host_id}>\n"
+        f"**Min bet:** {state.min_bet:,}  •  **Max bet:** {'∞' if state.max_bet == 0 else f'{state.max_bet:,}'}\n"
+        f"**Max players:** {state.max_players}  •  **Pot:** {state.pot:,}\n"
+        f"{'**Time left:** ' + str(remaining) + 's' if remaining is not None else ''}"
+    )
+    emb = discord.Embed(title="🏇 Horse Race — Lobby", description=desc, color=discord.Color.blurple())
+    if state.racers:
+        emb.add_field(
+            name="Players",
+            value="\\n".join(
+                f"`{i:>2}.` {r.emoji} **{r.display}** — **{r.bet:,}**"
+                for i, r in enumerate(state.racers.values(), start=1)
+            ),
+            inline=False,
+        )
+    else:
+        emb.add_field(name="Players", value="*No one yet. Click **Join** to enter and place your bet!*", inline=False)
+    emb.set_footer(text="Use Join to enter. Starts automatically when time is up.")
+    return emb
+
+def _hr_render_race(self, state: HRState, prestart: bool = False) -> discord.Embed:
+    title = "🏇 Horse Race — GO!" if not prestart else "🏇 Horse Race — Ready..."
+    emb = discord.Embed(title=title, color=discord.Color.green())
+    emb.description = f"**Pot:** {state.pot:,}   •   **Finish:** {HR_FLAG}\\n"
+    lines = []
+    for r in state.racers.values():
+        bar = _hr_bar(r.pos, HR_TRACK_LENGTH)
+        lines.append(f"{r.emoji} **{r.display}**\\n`{bar}` {HR_FLAG}\\n")
+    if lines:
+        emb.add_field(name="Track", value="\\n".join(lines), inline=False)
+    standings = sorted(state.racers.values(), key=lambda x: (x.pos, x.bet), reverse=True)
+    board = []
+    for idx, r in enumerate(standings[:4], start=1):
+        medal = HR_MEDALS[idx - 1] if idx <= len(HR_MEDALS) else f"{idx}."
+        board.append(f"{medal} {r.emoji} **{r.display}** — {r.pos}/{HR_TRACK_LENGTH}")
+    if board:
+        emb.add_field(name="Standings", value="\\n".join(board), inline=False)
+    emb.set_footer(text="Hit Boost once per race for a tiny push • Good luck!")
+    return emb
+
+def _hr_render_finish(self, state: HRState) -> discord.Embed:
+    winners = [state.racers[uid] for uid in state.winners]
+    if len(winners) == 1:
+        win_text = f"{winners[0].emoji} **{winners[0].display}** wins!"
+    else:
+        win_text = ", ".join(f"{r.emoji} **{r.display}**" for r in winners) + " **tie for the win!**"
+    payout_each = state.pot // max(1, len(winners)) if winners else 0
+    emb = discord.Embed(title="🏁 Race Finished!", color=discord.Color.gold())
+    emb.description = f"{win_text}\\n**Pot:** {state.pot:,} • **Payout:** {payout_each:,} each"
+    track_lines = []
+    for r in state.racers.values():
+        bar = _hr_bar(r.pos, HR_TRACK_LENGTH)
+        mark = "✅" if r.user_id in state.winners else ""
+        track_lines.append(f"{r.emoji} **{r.display}** {mark}\\n`{bar}` {HR_FLAG}\\n")
+    emb.add_field(name="Final Track", value="\\n".join(track_lines), inline=False)
+    return emb
+
+async def _hr_run(self, state: HRState, msg: discord.Message, *, solo_profit: bool = False):
+    # 3..2..1..
+    try:
+        await msg.edit(embed=self._hr_render_race(state, prestart=True), view=HRRaceView(state))
+        await _asyncio_hr.sleep(1.2)
+        for count in ("3️⃣", "2️⃣", "1️⃣", "🏁"):
+            em = self._hr_render_race(state, prestart=False)
+            em.set_footer(text=f"Start in {count} • Hit Boost once per race for a tiny push")
+            await msg.edit(embed=em, view=HRRaceView(state))
+            await _asyncio_hr.sleep(0.9)
+    except Exception:
+        pass
+
+    state.running = True
+    order = list(state.racers.keys())
+    while not state.finished:
+        for uid in order:
+            r = state.racers[uid]
+            base = _random_hr.randint(0, 3)
+            bonus = 1 if r.boosted and _random_hr.random() < 0.60 else 0
+            r.pos = min(HR_TRACK_LENGTH, r.pos + base + bonus)
+
+        leaders = [r for r in state.racers.values() if r.pos >= HR_TRACK_LENGTH]
+        if leaders:
+            maxpos = max(r.pos for r in leaders)
+            winners = [r for r in leaders if r.pos == maxpos]
+            state.finished = True
+            state.winners = [r.user_id for r in winners]
+
+        try:
+            await msg.edit(embed=self._hr_render_race(state), view=HRRaceView(state) if not state.finished else None)
+        except Exception:
+            pass
+        if state.finished:
+            break
+        await _asyncio_hr.sleep(HR_TICK_SECONDS)
+
+    # Payouts
+    if state.winners:
+        if len(state.racers) == 1 and solo_profit:
+            lone = next(iter(state.racers.values()))
+            await self._apply_credit(lone.user_id, lone.bet * 2)  # net +bet profit
+            state.pot = lone.bet * 2  # display
+        else:
+            payout_each = state.pot // len(state.winners)
+            for uid in state.winners:
+                await self._apply_credit(uid, payout_each)
+
+    try:
+        await msg.edit(embed=self._hr_render_finish(state), view=None)
+    except Exception:
+        pass
+
+@app_commands.command(name="horserace", description="Create a multiplayer horse race with betting and animations.")
+@app_commands.describe(min_bet="Minimum bet (default 50)", max_bet="Maximum bet (0 = unlimited)", max_players="2–12 players", join_seconds="Join window (10–180s)")
+async def horserace(self, inter: discord.Interaction, min_bet: int = 50, max_bet: int = 0, max_players: int = 6, join_seconds: int = 45):
+    min_bet = max(1, int(min_bet or 50))
+    max_bet = max(0, int(max_bet or 0))
+    max_players = max(2, min(12, int(max_players or 6)))
+    join_seconds = max(10, min(180, int(join_seconds or 45)))
+
+    state = HRState(
+        guild_id=inter.guild.id,
+        channel_id=inter.channel_id,
+        host_id=inter.user.id,
+        min_bet=min_bet,
+        max_bet=max_bet,
+        max_players=max_players,
+        join_seconds=join_seconds,
+    )
+
+    view = discord.ui.View(timeout=None)
+    join_btn = discord.ui.Button(label="Join", style=discord.ButtonStyle.success, emoji="➕")
+    async def _join_cb(i: discord.Interaction):
+        await i.response.send_modal(HRBetModal(self, state))
+    join_btn.callback = _join_cb
+    view.add_item(join_btn)
+
+    await inter.response.send_message(embed=self._hr_render_lobby(state), view=view)
+    msg = await inter.original_response()
+    state.message_id = msg.id
+
+    # Countdown -> auto start / solo / cancel
+    for remaining in range(join_seconds, 0, -1):
+        if not state.lobby_open:
+            break
+        if remaining % HR_JOIN_EDIT_EVERY == 0 or remaining in (5, 4, 3, 2, 1):
+            await msg.edit(embed=self._hr_render_lobby(state, remaining), view=view)
+        await _asyncio_hr.sleep(1)
+
+    state.lobby_open = False
+    if len(state.racers) >= 2:
+        await msg.edit(embed=self._hr_render_race(state, prestart=True), view=HRRaceView(state))
+        await self._hr_run(state, msg)
+    elif len(state.racers) == 1:
+        lone = next(iter(state.racers.values()))
+        offer = discord.Embed(
+            title="🏇 Solo Run",
+            description=f"Only **{lone.display}** joined. Starting a **solo** race — you’ll profit (+bet) if you finish!",
+            color=discord.Color.orange(),
+        )
+        await msg.edit(embed=offer, view=HRRaceView(state))
+        await self._hr_run(state, msg, solo_profit=True)
+    else:
+        await msg.edit(embed=discord.Embed(
+            title="🏇 Horse Race — No players",
+            description="Lobby closed.",
+            color=discord.Color.red(),
+        ), view=None)
 async def setup(bot: commands.Bot):
     await bot.add_cog(GamesCog(bot))
