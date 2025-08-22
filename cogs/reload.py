@@ -2,13 +2,14 @@ import os
 import discord
 from discord.ext import commands
 from discord import app_commands
-
+from cogs.admin_gates import gated
 class Reload(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @app_commands.command(name="reload", description="Reload a cog (auto-detects cogs/; syncs this guild or global)")
     @app_commands.describe(cog="Cog file name (without .py)")
+    @gated()
     async def reload(self, interaction: discord.Interaction, cog: str):
         await interaction.response.defer(thinking=True, ephemeral=True)
 
