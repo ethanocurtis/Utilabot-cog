@@ -2,3 +2,4 @@ aiohttp>=3.9.5
 SQLAlchemy>=2.0.30
 discord.py[voice]>=2.4.0
 yt-dlp>=2024.05.27
+aiosqlite
