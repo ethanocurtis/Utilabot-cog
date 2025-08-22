@@ -119,6 +119,7 @@ class Moderation(commands.Cog):
     # ---------- /purge ----------
     @app_commands.command(name="purge", description="Bulk delete recent messages (max 1000).")
     @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
+    @gated()
     async def purge(
         self,
         inter: discord.Interaction,
@@ -153,6 +154,7 @@ class Moderation(commands.Cog):
         action="Choose what to do",
         value="For 'set': duration like 10s, 2m, or just 2 (minutes). Ignored for other actions."
     )
+    @gated()
     @app_commands.choices(
         action=[
             app_commands.Choice(name="set", value="set"),
