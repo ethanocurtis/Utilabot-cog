@@ -24,6 +24,7 @@ COGS = [
     "cogs.moderation_cog",
     "cogs.pins",
     "cogs.audio",
+    "cogs.horserace",
 ]
 
 class UtilaBot(commands.Bot):
