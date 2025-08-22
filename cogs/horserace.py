@@ -211,9 +211,6 @@ class LobbyView(discord.ui.View):
 
 
 class SoloContinueView(discord.ui.View):
-    def __init.me__(self):
-        pass
-
     def __init__(self, *, timeout: float = 20.0):
         super().__init__(timeout=timeout)
         self.choice: Optional[bool] = None  # True=continue solo, False=cancel
