@@ -322,7 +322,7 @@ class BusinessCog(commands.Cog):
 
     # ----- Admin commands -----
 
-    @app_commands.command(name="business set price", description="(Admin) Set the purchase price of a business.")
+    @app_commands.command(name="business_set_price", description="(Admin) Set the purchase price of a business.")
     @app_commands.describe(name="Business name", new_cost="New purchase price (credits)")
     @app_commands.autocomplete(name=_business_name_autocomplete)
     async def business_set_price(self, inter: discord.Interaction, name: str, new_cost: int):
