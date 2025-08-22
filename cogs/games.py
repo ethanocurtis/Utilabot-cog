@@ -917,9 +917,8 @@ GamesCog._hr_render_finish = _hr_render_finish
 GamesCog._hr_run = _hr_run
 
 # Command to start a horse race
-@app_commands.command(name="horserace", description="Create a multiplayer horse race with betting and animations.")
-@app_commands.describe(min_bet="Minimum bet per player (default 50)", max_bet="Maximum bet (0 = unlimited)", max_players="Max players (2–12)", join_seconds="Join window in seconds (10–180)")
-async def horserace(self: GamesCog, inter: discord.Interaction, min_bet: int = 50, max_bet: int = 0, max_players: int = 6, join_seconds: int = 45):
+
+async def _hr_horserace_impl(self: GamesCog, inter: discord.Interaction, min_bet: int = 50, max_bet: int = 0, max_players: int = 6, join_seconds: int = 45):
     # per-channel race guard stored on cog (create if missing)
     if not hasattr(self, "_hr_active"):
         self._hr_active = {}
@@ -993,5 +992,9 @@ async def horserace(self: GamesCog, inter: discord.Interaction, min_bet: int = 5
             self._hr_active.pop(inter.channel_id, None)
         asyncio.create_task(_delayed_cleanup())
 
+
+
+# Register horserace as an app command on the GamesCog class
+GamesCog.horserace = app_commands.command(name="horserace", description="Create a multiplayer horse race with betting and animations.")(_hr_horserace_impl)
 async def setup(bot: commands.Bot):
     await bot.add_cog(GamesCog(bot))
