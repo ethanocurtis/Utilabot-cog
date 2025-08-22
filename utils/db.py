@@ -169,19 +169,44 @@ def run_migrations(engine):
         _add_notes_note_no_and_index(conn)
         _backfill_note_no_compact(conn)
 
-    # 4) Seed shop items & businesses (unchanged)
-    from sqlalchemy.orm import Session
-    with Session(engine) as s:
-        if not s.query(ShopItem).first():
-            s.add_all([
-                ShopItem(name="Fishing Rod", price=100),
-                ShopItem(name="Bait", price=5),
-                ShopItem(name="Pickaxe", price=250),
-            ])
-        if not s.query(Business).first():
-            s.add_all([
-                Business(name="Lemonade Stand", cost=5000, hourly_yield=42),
-                Business(name="Food Truck", cost=25000, hourly_yield=250),
-                Business(name="Arcade", cost=100000, hourly_yield=1200),
-            ])
-        s.commit()
+    # 4) Seed shop items & businesses (idempotent: add missing by name only)
+from sqlalchemy.orm import Session
+with Session(engine) as s:
+    # --- Shop items ---
+    shop_defaults = [
+        ("Fishing Rod", 100),
+        ("Bait", 5),
+        ("Pickaxe", 250),
+    ]
+    existing_shop = {n for (n,) in s.query(ShopItem.name).all()}
+    for name, price in shop_defaults:
+        if name not in existing_shop:
+            s.add(ShopItem(name=name, price=price))
+
+    # --- Businesses ---
+    biz_defaults = [
+        # low
+        ("Lemonade Stand",   5_000,        42),
+        ("Food Truck",      25_000,       250),
+
+        # medium
+        ("Car Wash",        50_000,       400),
+        ("Gas Station",    120_000,       900),
+        ("Mini-Mart",      250_000,     1_800),
+
+        # high
+        ("Arcade",       1_000_000,     6_000),
+        ("Nightclub",    2_000_000,    12_000),
+        ("Solar Farm",   5_000_000,    30_000),
+        ("Logistics Fleet", 8_000_000, 48_000),
+        ("Data Center", 12_000_000,    90_000),
+        ("Stadium Rights", 20_000_000, 150_000),
+        ("Spaceport",   50_000_000,   400_000),
+    ]
+    # compare case-insensitively so “Car Wash” vs “car wash” counts as existing
+    existing_biz = {n.lower() for (n,) in s.query(Business.name).all()}
+    for name, cost, hourly in biz_defaults:
+        if name.lower() not in existing_biz:
+            s.add(Business(name=name, cost=cost, hourly_yield=hourly))
+
+    s.commit()
