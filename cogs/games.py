@@ -414,6 +414,82 @@ class GamesCog(commands.Cog):
                 return int(bal.credits)
         return await asyncio.to_thread(_work)
 
+
+# --------- Horse Race (slash) ---------
+@app_commands.command(name="horserace", description="Create a multiplayer horse race with betting and animations.")
+@app_commands.describe(
+    min_bet="Minimum bet per player (default 50)",
+    max_bet="Maximum bet (0 = unlimited)",
+    max_players="Max players (2–12)",
+    join_seconds="Join window in seconds (10–180)",
+)
+async def horserace(self, inter: discord.Interaction, min_bet: int = 50, max_bet: int = 0, max_players: int = 6, join_seconds: int = 45):
+    # per-channel race guard stored on cog (create if missing)
+    if not hasattr(self, "_hr_active"):
+        self._hr_active = {}
+    if inter.channel_id in self._hr_active:
+        return await inter.response.send_message("There is already an active race in this channel.", ephemeral=True)
+
+    max_players = max(2, min(12, int(max_players or 6)))
+    min_bet = max(1, int(min_bet or 50))
+    max_bet = max(0, int(max_bet or 0))
+    join_seconds = max(10, min(180, int(join_seconds or 45)))
+
+    state = HRState(
+        guild_id=inter.guild.id,
+        channel_id=inter.channel_id,
+        host_id=inter.user.id,
+        min_bet=min_bet,
+        max_bet=max_bet,
+        max_players=max_players,
+        join_seconds=join_seconds,
+    )
+    self._hr_active[inter.channel_id] = state
+
+    view = self._hr_make_lobby_view(state)
+    emb = self._hr_render_lobby(state)
+    await inter.response.send_message(embed=emb, view=view)
+    msg = await inter.original_response()
+    state.message_id = msg.id
+
+    try:
+        for remaining in range(join_seconds, 0, -1):
+            if not state.lobby_open:
+                break
+            if remaining % JOIN_COUNTDOWN_EDIT_EVERY == 0 or remaining in (join_seconds, 5, 4, 3, 2, 1):
+                await msg.edit(embed=self._hr_render_lobby(state, remaining), view=view)
+            await asyncio.sleep(1)
+
+        if state.lobby_open:
+            state.lobby_open = False
+            if len(state.racers) >= 2:
+                state.running = True
+                await msg.edit(embed=self._hr_render_race(state, prestart=True), view=self._hr_make_race_view(state))
+                await self._hr_run(state)
+            elif len(state.racers) == 1:
+                only = next(iter(state.racers.values()))
+                state.solo_allowed = True
+                offer = discord.Embed(
+                    title="🏇 Horse Race — Not enough players",
+                    description=f"Only **{only.display}** joined.\nYou can **Race Alone** for a chance at a **solo profit (+bet)**, or Cancel to refund.",
+                    color=discord.Color.orange(),
+                )
+                await msg.edit(embed=offer, view=HRSoloView(self, state, only.user_id))
+                return
+            else:
+                em = discord.Embed(
+                    title="🏇 Horse Race — No players",
+                    description="No one joined. Lobby closed.",
+                    color=discord.Color.red(),
+                )
+                await msg.edit(embed=em, view=None)
+                self._hr_active.pop(inter.channel_id, None)
+                return
+    finally:
+        async def _delayed_cleanup():
+            await asyncio.sleep(2)
+            self._hr_active.pop(inter.channel_id, None)
+        asyncio.create_task(_delayed_cleanup())
     # --------- Coinflip (animated + Reflip) ---------
 
     @app_commands.command(name="coinflip", description="Bet on a coin flip.")
