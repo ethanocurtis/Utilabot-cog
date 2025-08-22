@@ -27,6 +27,7 @@ COGS = [
     "cogs.horserace",
     "cogs.slots",
     "cogs.roulette",
+    "admingate",
 ]
 
 class UtilaBot(commands.Bot):
