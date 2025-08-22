@@ -343,6 +343,68 @@ class AdminGates(commands.Cog):
     admin = app_commands.Group(name="admin", description="Admin utilities")
     gate = app_commands.Group(name="gate", description="Configure command gating", parent=admin)
 
+   # ---------- /admin gate help ----------
+    @gate.command(name="help", description="Show a quick cheat sheet for Admin Gates.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def gate_help(self, inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True)
+        mode = await self.store.mode_get(inter.guild_id)
+        bypass = await self.store.bypass_get(inter.guild_id)
+
+        names = _collect_command_names(self.bot.tree)
+        sample = ", ".join(names[:5]) if names else "pin add, market list, river stage"
+
+        emb = discord.Embed(
+            title="Admin Gate — Cheat Sheet",
+            description=(
+                "Centralized access control for your slash commands.\n"
+                f"**Default policy:** `{mode}` • **Manage Server bypass:** `{'on' if bypass else 'off'}`"
+            ),
+        )
+        emb.add_field(
+            name="Quick Start",
+            value=(
+                "• Make a command admin-only:\n"
+                "`/admin gate add command:\"market list\" scope:admin_only effect:allow priority:100`\n"
+                "• Also allow Mods:\n"
+                "`/admin gate add command:\"market list\" scope:role target_role:@Moderator effect:allow priority:90`\n"
+                "• Block in #general:\n"
+                "`/admin gate add command:\"market list\" scope:channel target_channel:#general effect:deny priority:95`"
+            ),
+            inline=False,
+        )
+        emb.add_field(
+            name="Scopes",
+            value=(
+                "`role` (needs target_role) • `user` (target_user) • `channel` (target_channel)\n"
+                "`admin_only` (Admin/Manage Server) • `everyone` (all members)"
+            ),
+            inline=False,
+        )
+        emb.add_field(
+            name="Effects & Priority",
+            value="`allow` or `deny`. Higher `priority` wins. If no rule matches, falls back to `/admin gate mode`.",
+            inline=False,
+        )
+        emb.add_field(
+            name="Defaults & Bypass",
+            value="`/admin gate mode` sets default allow/deny • `/admin gate bypass` toggles Manage Server bypass",
+            inline=False,
+        )
+        emb.add_field(
+            name="Testing",
+            value="Use `/admin gate test command:<cmd> user:@User channel:#room` to dry-run a check.",
+            inline=False,
+        )
+        emb.add_field(
+            name="Finding Command Names",
+            value=f"Autocomplete helps. Examples: `{sample}`",
+            inline=False,
+        )
+        emb.set_footer(text="Tip: Put @gated() on a Group to gate all its subcommands at once.")
+
+        await inter.followup.send(embed=emb, ephemeral=True)
+   
     # ---------- /admin gate add ----------
     @gate.command(name="add", description="Add a gating rule (priority: higher wins).")
     @app_commands.describe(
