@@ -10,7 +10,7 @@ from sqlalchemy import text
 from utils.db import ShopItem, Inventory, Balance
 from utils.common import ensure_user
 
-DAILY_AMOUNT = 100,000
+DAILY_AMOUNT = 100000
 DAILY_COOLDOWN_HOURS = 24
 
 
