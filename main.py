@@ -20,7 +20,6 @@ COGS = [
     "cogs.reminders",
     "cogs.notes",
     "cogs.kutt",
-    "cogs.reload",
     "cogs.moderation_cog",
     "cogs.pins",
     "cogs.audio",
