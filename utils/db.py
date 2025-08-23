@@ -177,6 +177,9 @@ def run_migrations(engine):
             ("Fishing Rod", 100),
             ("Bait", 5),
             ("Pickaxe", 250),
+            ("Torch", 500),
+            ("Rope", 500),
+            ("Sword", 1500)
         ]
         existing_shop = {n for (n,) in s.query(ShopItem.name).all()}
         for name, price in shop_defaults:
