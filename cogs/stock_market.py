@@ -28,9 +28,6 @@ from utils.common import ensure_user
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-MARKET_FILE = DATA_DIR / "market_state.json"
-PORTFOLIO_FILE = DATA_DIR / "portfolios.json"
-CONFIG_FILE = DATA_DIR / "stock_config.json"
 
 PRICE_TICK_MINUTES = 15         # how often prices change
 EVENT_EVERY_HOURS = 2           # how often to roll a possible event
@@ -81,6 +78,10 @@ class Company:
 
 # ---------- Persistence ----------
 
+MARKET_FILE = DATA_DIR / "market_state.json"
+PORTFOLIO_FILE = DATA_DIR / "portfolios.json"
+CONFIG_FILE = DATA_DIR / "stock_config.json"
+
 def _load_json(path: Path, default):
     if not path.exists():
         return default
@@ -122,7 +123,7 @@ def seed_companies(n=50) -> List[Company]:
     rnd = random.Random(RANDOM_SEED)
     companies: List[Company] = []
     used = set()
-    # distribute price & volatility bands
+    # distribute price bands & volatility bands:
     # 10 ultra (1000–2500), 15 high (250–800), 15 mid (50–200), 10 low (5–30)
     bands = (
         [(rnd.uniform(1000, 2500), rnd.uniform(0.015, 0.035)) for _ in range(10)] +
@@ -164,11 +165,6 @@ def save_market(market: Dict[str, Company]):
     _save_json(MARKET_FILE, {k: v.to_dict() for k, v in market.items()})
 
 def load_portfolios() -> Dict[str, dict]:
-    return _load_json(PORТFOLIO_FILE, {})  # <-- NOTE: typo guard below will fix
-# Fix a potential typo in case someone pastes wrong: ensure correct file var used
-PORTFOLIO_FILE = DATA_DIR / "portfolios.json"  # re-affirm
-
-def load_portfolios() -> Dict[str, dict]:
     return _load_json(PORTFOLIO_FILE, {})
 
 def save_portfolios(portfolios: Dict[str, dict]):
@@ -184,21 +180,6 @@ def trend_arrow(cur: float, prev: float) -> str:
     if cur > prev: return "📈"
     if cur < prev: return "📉"
     return "➖"
-
-def symbol_autocomplete_list(itx: discord.Interaction, query: str, max_items=20) -> List[app_commands.Choice[str]]:
-    cog = itx.client.get_cog("StockMarket")
-    market = cog.market if cog else {}
-    q = (query or "").lower().strip()
-    items = []
-    for c in market.values():
-        if q in c.symbol.lower() or q in c.name.lower():
-            items.append(app_commands.Choice(name=f"{c.symbol} — {c.name}", value=c.symbol))
-        if len(items) >= max_items:
-            break
-    if not items:
-        top = sorted(market.values(), key=lambda c: c.price, reverse=True)[:max_items]
-        items = [app_commands.Choice(name=f"{c.symbol} — {c.name}", value=c.symbol) for c in top]
-    return items
 
 # ---------- Cog ----------
 
@@ -338,15 +319,18 @@ class StockMarket(commands.Cog):
                 f"📢 **Market Event** — {('Company' if kind=='company' else 'Sector')} **{target}**\n"
                 f"{label} (impact {impact:+.0%})."
             )
+            # Send DMs; if a DM fails (privacy), remove subscriber
+            changed = False
             for uid in list(self.subscribers):
-                user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
-                if user:
-                    try:
+                try:
+                    user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                    if user:
                         await user.send(msg)
-                    except Exception:
-                        # if DM fails (privacy), drop them from list quietly
-                        self.subscribers.discard(uid)
-                        self._save_config()
+                except Exception:
+                    self.subscribers.discard(uid)
+                    changed = True
+            if changed:
+                self._save_config()
 
     # ----- Portfolio helpers -----
 
@@ -379,6 +363,21 @@ class StockMarket(commands.Cog):
         hv = self._holdings_value(user_id)
         return hv, float(cash), user_id
 
+    # ----- Autocomplete helper (async — required) -----
+
+    async def _symbol_ac(self, interaction: discord.Interaction, current: str):
+        q = (current or "").lower().strip()
+        items: List[app_commands.Choice[str]] = []
+        for c in self.market.values():
+            if q in c.symbol.lower() or q in c.name.lower():
+                items.append(app_commands.Choice(name=f"{c.symbol} — {c.name}", value=c.symbol))
+            if len(items) >= 20:
+                break
+        if not items:
+            top = sorted(self.market.values(), key=lambda c: c.price, reverse=True)[:20]
+            items = [app_commands.Choice(name=f"{c.symbol} — {c.name}", value=c.symbol) for c in top]
+        return items
+
     # ----- Commands -----
 
     @app_commands.command(name="stocks", description="Browse the fictional market (interactive).")
@@ -390,16 +389,22 @@ class StockMarket(commands.Cog):
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="stock_buy", description="Buy shares of a company.")
-    @app_commands.describe(symbol="Ticker symbol (autocomplete)", quantity="How many shares to buy")
-    @app_commands.autocomplete(symbol=lambda itx, cur: symbol_autocomplete_list(itx, cur))
+    @app_commands.describe(symbol="Ticker symbol", quantity="How many shares to buy")
     async def stock_buy(self, interaction: discord.Interaction, symbol: str, quantity: int):
         await self._do_buy(interaction, symbol, quantity)
 
+    @stock_buy.autocomplete("symbol")
+    async def stock_buy_symbol_ac(self, interaction: discord.Interaction, current: str):
+        return await self._symbol_ac(interaction, current)
+
     @app_commands.command(name="stock_sell", description="Sell shares of a company.")
-    @app_commands.describe(symbol="Ticker symbol (autocomplete)", quantity="How many shares to sell")
-    @app_commands.autocomplete(symbol=lambda itx, cur: symbol_autocomplete_list(itx, cur))
+    @app_commands.describe(symbol="Ticker symbol", quantity="How many shares to sell")
     async def stock_sell(self, interaction: discord.Interaction, symbol: str, quantity: int):
         await self._do_sell(interaction, symbol, quantity)
+
+    @stock_sell.autocomplete("symbol")
+    async def stock_sell_symbol_ac(self, interaction: discord.Interaction, current: str):
+        return await self._symbol_ac(interaction, current)
 
     @app_commands.command(name="portfolio", description="View your portfolio & P/L.")
     async def portfolio_cmd(self, interaction: discord.Interaction):
@@ -425,8 +430,6 @@ class StockMarket(commands.Cog):
                 lines.append(f"**{c.symbol}** · {c.name} · {c.sector} — {arrow} {fmt_money(c.price)}")
             embed = discord.Embed(title=f"Search results for “{query}”", description="\n".join(lines), color=discord.Color.blurple())
         await interaction.followup.send(embed=embed, ephemeral=True)
-
-    # --- Leaderboard & Movers ---
 
     @app_commands.command(name="stocks_top", description="Show top users by net worth (cash + holdings).")
     @app_commands.describe(limit="How many users to show (default 10, max 25)")
@@ -500,12 +503,9 @@ class StockMarket(commands.Cog):
 
         await interaction.followup.send(embed=emb, ephemeral=True)
 
-    # --- Config & Subscriptions ---
-
     @app_commands.command(name="stocks_config", description="Set or view the market announce channel (admins).")
     @app_commands.describe(channel="Channel for event announcements")
     async def stocks_config(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-        # Permission check (works for both text & slash)
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("You need **Manage Server** to change this.", ephemeral=True)
             return
