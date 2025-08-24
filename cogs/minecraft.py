@@ -109,13 +109,7 @@ async def rcon_exec(host: str, port: int, password: str, command: str) -> Tuple[
 
 
 async def rcon_stop_sequence(host: str, port: int, password: str, *, warn_secs: int = 5) -> Tuple[bool, str]:
-    """
-    Graceful stop:
-      1) say server is stopping
-      2) save-all flush
-      3) stop
-    Returns (ok, last_message_or_error)
-    """
+    """Graceful stop (announce → save-all flush → stop)."""
     ok, resp = await rcon_exec(host, port, password, f"say Server stopping in {warn_secs}s… Please log out safely.")
     if not ok:
         return False, f"announce failed: {resp}"
@@ -175,7 +169,7 @@ class SettingsSelect(discord.ui.Select):
             # Instant (RCON)
             discord.SelectOption(label="Difficulty", description="Peaceful/Easy/Normal/Hard (instant)", value="difficulty", emoji="⚔️"),
             discord.SelectOption(label="Default Gamemode", description="Survival/Creative/Adventure/Spectator (instant)", value="defaultgamemode", emoji="🎮"),
-            discord.SelectOption(label="Whitelist", description="Turn whitelist on/off (instant)", value="whitelist", emoji="✅"),
+            discord.SelectOption(label="Whitelist ON/OFF", description="Toggle whitelist (instant)", value="whitelist", emoji="✅"),
             # Properties (restart)
             discord.SelectOption(label="view-distance", description="2–32 (restart required)", value="view-distance", emoji="🗺️"),
             discord.SelectOption(label="max-players", description="1–200 (restart required)", value="max-players", emoji="👥"),
@@ -196,7 +190,7 @@ class SettingsSelect(discord.ui.Select):
             return await interaction.response.send_message("Pick a default gamemode:", view=GamemodeView(self.cog, self.guild_id), ephemeral=True)
 
         if value == "whitelist":
-            return await interaction.response.send_message("Toggle whitelist:", view=WhitelistView(self.cog, self.guild_id), ephemeral=True)
+            return await interaction.response.send_message("Toggle whitelist:", view=WhitelistToggleView(self.cog, self.guild_id), ephemeral=True)
 
         if not cfg.properties_path:
             return await interaction.response.send_message(
@@ -256,19 +250,21 @@ class GamemodeView(discord.ui.View):
         await interaction.followup.send((f"✅ Default gamemode set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
 
-class WhitelistView(discord.ui.View):
+class WhitelistToggleView(discord.ui.View):
+    """Simple ON/OFF toggle for whitelist."""
     def __init__(self, cog: "MinecraftCog", guild_id: int, timeout: Optional[float] = 60):
         super().__init__(timeout=timeout); self.cog = cog; self.guild_id = guild_id
 
     @discord.ui.button(label="Whitelist ON", style=discord.ButtonStyle.success, emoji="✅")
     async def wl_on(self, interaction: discord.Interaction, _): await self._toggle(interaction, True)
+
     @discord.ui.button(label="Whitelist OFF", style=discord.ButtonStyle.danger, emoji="❌")
     async def wl_off(self, interaction: discord.Interaction, _): await self._toggle(interaction, False)
 
     async def _toggle(self, interaction: discord.Interaction, turn_on: bool):
         cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.rcon_host or not cfg.rcon_port or not cfg.rcon_password:
-            return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        if not cfg or cfg.kind != "java" or not cfg.rcon_host or not cfg.rcon_port or not cfg.rcon_password:
+            return await interaction.response.send_message("⚠️ Java + RCON required and must be configured.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         cmd = "whitelist on" if turn_on else "whitelist off"
         ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, cmd)
@@ -276,59 +272,88 @@ class WhitelistView(discord.ui.View):
         await interaction.followup.send(msg, ephemeral=True)
 
 
-class PropertyNumberModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, key: str, min_v: int, max_v: int, *, title: str):
-        super().__init__(title=title)
-        self.cog = cog; self.guild_id = guild_id; self.key = key; self.min_v = min_v; self.max_v = max_v
-        self.value = discord.ui.TextInput(label=f"{key}", placeholder=f"{min_v}–{max_v}", required=True, min_length=1, max_length=4)
-        self.add_item(self.value)
+# ---------- New: Whitelist Manager (Add / Remove / List) ----------
+class WhitelistAddModal(discord.ui.Modal):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(title="Add player to whitelist")
+        self.cog = cog; self.guild_id = guild_id
+        self.name = discord.ui.TextInput(label="Java Username", placeholder="e.g., Notch", required=True, min_length=2, max_length=16)
+        self.add_item(self.name)
 
     async def on_submit(self, interaction: discord.Interaction):
         cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.properties_path:
-            return await interaction.response.send_message("⚠️ No properties path configured.", ephemeral=True)
-        try:
-            n = int(str(self.value.value).strip())
-        except ValueError:
-            return await interaction.response.send_message("Please enter a valid number.", ephemeral=True)
-        if not (self.min_v <= n <= self.max_v):
-            return await interaction.response.send_message(f"Value must be between {self.min_v} and {self.max_v}.", ephemeral=True)
-        try:
-            lines = read_properties(cfg.properties_path)
-            new_lines, _ = set_property_line(lines, self.key, str(n))
-            write_properties(cfg.properties_path, new_lines)
-            await interaction.response.send_message(
-                f"✅ `{self.key}` updated to **{n}** in `server.properties`.\n🔁 Restart the server for changes to take effect.",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to update: `{e}`", ephemeral=True)
+        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ Java + RCON required.", ephemeral=True)
+        username = str(self.name.value).strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"whitelist add {username}")
+        msg = f"✅ **{username}** added to whitelist.\n```{resp}```" if ok else f"❌ Failed to add: `{resp}`"
+        await interaction.followup.send(msg, ephemeral=True)
 
 
-class PropertyBooleanModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, key: str, *, title: str):
-        super().__init__(title=title)
-        self.cog = cog; self.guild_id = guild_id; self.key = key
-        self.value = discord.ui.TextInput(label=f"{key}", placeholder="true or false", required=True, min_length=4, max_length=5)
-        self.add_item(self.value)
+class WhitelistRemoveModal(discord.ui.Modal):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(title="Remove player from whitelist")
+        self.cog = cog; self.guild_id = guild_id
+        self.name = discord.ui.TextInput(label="Java Username", placeholder="e.g., Notch", required=True, min_length=2, max_length=16)
+        self.add_item(self.name)
 
     async def on_submit(self, interaction: discord.Interaction):
         cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.properties_path:
-            return await interaction.response.send_message("⚠️ No properties path configured.", ephemeral=True)
-        val = str(self.value.value).strip().lower()
-        if val not in {"true", "false"}:
-            return await interaction.response.send_message("Enter `true` or `false`.", ephemeral=True)
-        try:
-            lines = read_properties(cfg.properties_path)
-            new_lines, _ = set_property_line(lines, self.key, val)
-            write_properties(cfg.properties_path, new_lines)
-            await interaction.response.send_message(
-                f"✅ `{self.key}` updated to **{val}** in `server.properties`.\n🔁 Restart the server for changes to take effect.",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to update: `{e}`", ephemeral=True)
+        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ Java + RCON required.", ephemeral=True)
+        username = str(self.name.value).strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"whitelist remove {username}")
+        msg = f"✅ **{username}** removed from whitelist.\n```{resp}```" if ok else f"❌ Failed to remove: `{resp}`"
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+class WhitelistManagerView(discord.ui.View):
+    """Manager with Add / Remove / List actions."""
+    def __init__(self, cog: "MinecraftCog", guild_id: int, timeout: Optional[int] = 90):
+        super().__init__(timeout=timeout)
+        self.cog = cog; self.guild_id = guild_id
+
+    @discord.ui.button(label="Add Player", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_btn(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(WhitelistAddModal(self.cog, self.guild_id))
+
+    @discord.ui.button(label="Remove Player", style=discord.ButtonStyle.danger, emoji="➖")
+    async def remove_btn(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(WhitelistRemoveModal(self.cog, self.guild_id))
+
+    @discord.ui.button(label="Show List", style=discord.ButtonStyle.secondary, emoji="📜")
+    async def list_btn(self, interaction: discord.Interaction, _):
+        cfg = self.cog.configs.get(str(self.guild_id))
+        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ Java + RCON required.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, "whitelist list")
+        if not ok:
+            return await interaction.followup.send(f"❌ Failed to list: `{resp}`", ephemeral=True)
+
+        # Try to extract names from the server response
+        text = resp.strip()
+        # Common responses look like: "There are X whitelisted players: name1, name2, name3"
+        names: List[str] = []
+        if ":" in text:
+            names_part = text.split(":", 1)[1].strip()
+            if names_part:
+                names = [n.strip() for n in names_part.split(",") if n.strip()]
+        if not names and text:
+            # Fallback, try whitespace split if server uses different format
+            names = [n.strip(",") for n in text.split() if n and n.lower() not in {"there", "are", "whitelisted", "players"}]
+
+        if not names:
+            return await interaction.followup.send("ℹ️ Whitelist appears to be **empty**.", ephemeral=True)
+
+        # Chunk into 20 per field to keep it readable
+        chunks = [names[i:i+20] for i in range(0, len(names), 20)]
+        embed = discord.Embed(title="Whitelisted Players", color=discord.Color.green())
+        for idx, chunk in enumerate(chunks, 1):
+            embed.add_field(name=f"Page {idx}", value=", ".join(chunk), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class ConfirmStopView(discord.ui.View):
@@ -374,6 +399,13 @@ class PanelView(discord.ui.View):
         if not cfg:
             return await interaction.response.send_message("No config found.", ephemeral=True)
         await interaction.response.send_message(f"`{cfg.host}:{cfg.port}` (for **{cfg.kind.upper()}**)", ephemeral=True)
+
+    @discord.ui.button(label="Whitelist", style=discord.ButtonStyle.secondary, emoji="👤")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def wl_manage(self, interaction: discord.Interaction, _):
+        await interaction.response.send_message(
+            "Whitelist manager:", view=WhitelistManagerView(self.cog, self.guild_id), ephemeral=True
+        )
 
     @discord.ui.button(label="Restart", style=discord.ButtonStyle.danger, emoji="🟧")
     @app_commands.checks.has_permissions(manage_guild=True)
