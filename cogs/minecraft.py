@@ -94,8 +94,17 @@ async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
 
 
 async def rcon_exec(host: str, port: int, password: str, command: str) -> Tuple[bool, str]:
-    """Execute a command via RCON. Uses a thread to avoid blocking."""
-    loop = asyncio.get_running_loop()
+    """
+    Execute a command via RCON.
+    Most commands are fine to run directly; mcrcon's signal handler breaks in threads.
+    """
+    try:
+        # Run sync in the main async loop (fast enough for short RCON ops)
+        with MCRcon(host, password, port=port) as rcon:
+            resp = rcon.command(command)
+            return True, resp or "(no response)"
+    except Exception as e:
+        return False, str(e)
 
     def run() -> Tuple[bool, str]:
         try:
