@@ -24,12 +24,14 @@ os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
 # =========================
 @dataclass
 class ServerConfig:
-    kind: str              # "java" or "bedrock"
+    kind: str                     # "java" or "bedrock"
     host: str
-    port: int
+    port: Optional[int] = None    # optional; defaults below
     rcon_host: Optional[str] = None
     rcon_port: Optional[int] = None
     rcon_password: Optional[str] = None
+    # legacy (ignored in RCON-only mode; kept for compatibility so old JSON loads)
+    properties_path: Optional[str] = None
 
 
 def load_all_configs() -> Dict[str, ServerConfig]:
@@ -39,7 +41,10 @@ def load_all_configs() -> Dict[str, ServerConfig]:
         raw = json.load(f)
     out: Dict[str, ServerConfig] = {}
     for gid, obj in raw.items():
-        out[gid] = ServerConfig(**obj)
+        # drop unknown keys to be future-proof
+        allowed = {"kind","host","port","rcon_host","rcon_port","rcon_password","properties_path"}
+        slim = {k: v for k, v in obj.items() if k in allowed}
+        out[gid] = ServerConfig(**slim)
     return out
 
 
@@ -50,15 +55,27 @@ def save_all_configs(cfgs: Dict[str, ServerConfig]) -> None:
 
 
 # =========================
+# Helpers
+# =========================
+def default_port_for(kind: str) -> int:
+    return 25565 if kind == "java" else 19132
+
+
+def effective_port(kind: str, port: Optional[int]) -> int:
+    return port if port is not None else default_port_for(kind)
+
+
+# =========================
 # MC utilities
 # =========================
-async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
+async def mc_status(kind: str, host: str, port: Optional[int]) -> Tuple[bool, Dict]:
     """Returns (ok, data). For Java/Bedrock, grabs status details."""
     loop = asyncio.get_running_loop()
+    p = effective_port(kind, port)
     data: Dict = {}
     try:
         if kind == "java":
-            server = await loop.run_in_executor(None, lambda: JavaServer(host, port))
+            server = await loop.run_in_executor(None, lambda: JavaServer(host, p))
             status = await loop.run_in_executor(None, server.status)
             data = {
                 "motd": getattr(status.description, "to_plain", lambda: str(status.description))(),
@@ -71,7 +88,7 @@ async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
             return True, data
 
         elif kind == "bedrock":
-            server = BedrockServer(host, port)
+            server = BedrockServer(host, p)
             status = await loop.run_in_executor(None, server.status)
             data = {
                 "motd": status.motd,
@@ -79,7 +96,7 @@ async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
                 "latency": None,
                 "players_online": status.players_online,
                 "players_max": status.players_max,
-                "sample": [],  # Bedrock ping doesn't provide player samples
+                "sample": [],  # Bedrock ping doesn't provide names
             }
             return True, data
 
@@ -94,7 +111,8 @@ async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
 # =========================
 async def rcon_exec(host: str, port: int, password: str, command: str) -> Tuple[bool, str]:
     """
-    Execute a command via RCON in the event loop thread (mcrcon's signals can break in thread pools).
+    Execute a command via RCON in the event loop thread
+    (mcrcon's signal usage can fail in thread pools).
     """
     try:
         with MCRcon(host, password, port=port) as rcon:
@@ -160,15 +178,11 @@ RCON_COMMANDS: List[RconCmd] = [
     ]),
     RconCmd("pardon", "Pardon <name>", "pardon {name}", fields=[{"id":"name","label":"Player name","placeholder":"Friend","min":2,"max":16,"required":True}]),
 
-    # Gameplay settings (live; these three are handled by choice views, not text)
+    # Gameplay (handled by choice UIs)
     RconCmd("difficulty", "Difficulty (pick)", "difficulty {level}"),
     RconCmd("gamemode", "Default gamemode (pick)", "defaultgamemode {mode}"),
     RconCmd("weather", "Weather (pick)", "weather {kind}"),
-
-    # Time presets (handled by buttons)
     RconCmd("time", "Time set (pick)", "time set {value}"),
-
-    # Gamerule presets (handled by a dedicated UI)
     RconCmd("gamerule_preset", "Gamerule presets (pick/toggle)", "gamerule {rule} {value}"),
 
     # Utility
@@ -197,8 +211,9 @@ class DifficultyChoiceView(discord.ui.View):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"difficulty {value}")
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, f"difficulty {value}")
         await interaction.followup.send((f"✅ Difficulty set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
     @discord.ui.button(label="Peaceful", style=discord.ButtonStyle.secondary, emoji="🕊️")
@@ -219,8 +234,9 @@ class GamemodeChoiceView(discord.ui.View):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"defaultgamemode {value}")
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, f"defaultgamemode {value}")
         await interaction.followup.send((f"✅ Default gamemode set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
     @discord.ui.button(label="Survival", style=discord.ButtonStyle.secondary, emoji="⛏️")
@@ -241,8 +257,9 @@ class WeatherChoiceView(discord.ui.View):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"weather {kind}")
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, f"weather {kind}")
         await interaction.followup.send((f"✅ Weather set to **{kind}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
     @discord.ui.button(label="Clear", style=discord.ButtonStyle.success, emoji="☀️")
@@ -261,8 +278,9 @@ class TimeChoiceView(discord.ui.View):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"time set {value}")
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, f"time set {value}")
         await interaction.followup.send((f"✅ Time set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
     @discord.ui.button(label="Day", style=discord.ButtonStyle.secondary, emoji="🌤️")
@@ -283,7 +301,7 @@ GAMERULE_PRESETS = [
     ("doMobGriefing", ["true", "false"]),
     ("doFireTick", ["true", "false"]),
     ("doImmediateRespawn", ["true", "false"]),
-    ("showCoordinates", ["true", "false"]),  # Bedrock-ism, harmless if not found
+    ("showCoordinates", ["true", "false"]),  # harmless if not present
 ]
 
 class GamerulePresetView(discord.ui.View):
@@ -299,7 +317,6 @@ class GameruleSelect(discord.ui.Select):
         super().__init__(placeholder="Choose gamerule…", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        # store selection on the view
         self.view.selected_rule = self.values[0]
         await interaction.response.send_message(f"Rule selected: `{self.view.selected_rule}`. Now pick a value.", ephemeral=True)
 
@@ -318,9 +335,10 @@ class GameruleValueSelect(discord.ui.Select):
         if not rule:
             return await interaction.response.send_message("Pick a gamerule first.", ephemeral=True)
 
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         value = self.values[0]
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"gamerule {rule} {value}")
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, f"gamerule {rule} {value}")
         await interaction.followup.send((f"✅ `gamerule {rule} {value}`\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
 
@@ -353,8 +371,9 @@ class CommandModal(discord.ui.Modal):
         values = {fid: (str(inp.value).strip() if inp.value is not None else "") for fid, inp in self.inputs.items()}
         command = self.cmd.template.format(**values).strip()
 
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, command)
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, command)
         msg = f"✅ Ran `{command}`.\n```{resp}```" if ok else f"❌ `{command}` failed:\n`{resp}`"
         await interaction.followup.send(msg, ephemeral=True)
 
@@ -372,8 +391,9 @@ class ConfirmStopView(discord.ui.View):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ Java + RCON required and must be configured.", ephemeral=True)
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_stop_sequence(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password)
+        ok, resp = await rcon_stop_sequence(cfg.rcon_host, rp, cfg.rcon_password)
         if ok:
             hint = " (your service manager should bring it back up)" if self.restart_hint else ""
             await interaction.followup.send(f"✅ Stop issued{hint}.", ephemeral=True)
@@ -433,8 +453,9 @@ class RconSelect(discord.ui.Select):
             return await interaction.response.send_modal(CommandModal(self.cog, self.guild_id, cmd))
 
         # No fields → run immediately
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, cmd.template)
+        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, cmd.template)
         msg = f"✅ Ran `{cmd.template}`.\n```{resp}```" if ok else f"❌ `{cmd.template}` failed:\n`{resp}`"
         await interaction.followup.send(msg, ephemeral=True)
 
@@ -456,7 +477,8 @@ class PanelView(discord.ui.View):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg:
             return await interaction.response.send_message("No config found.", ephemeral=True)
-        await interaction.response.send_message(f"`{cfg.host}:{cfg.port}` (for **{cfg.kind.upper()}**)", ephemeral=True)
+        show_port = effective_port(cfg.kind, cfg.port)
+        await interaction.response.send_message(f"`{cfg.host}:{show_port}` (for **{cfg.kind.upper()}**)", ephemeral=True)
 
     @discord.ui.button(label="Restart (stop)", style=discord.ButtonStyle.danger, emoji="🟧")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -495,8 +517,9 @@ class MinecraftCog(commands.Cog):
             return embed
 
         ok, data = await mc_status(cfg.kind, cfg.host, cfg.port)
+        show_port = effective_port(cfg.kind, cfg.port)
         if ok:
-            status_line = f"**Online** `{cfg.host}:{cfg.port}`"
+            status_line = f"**Online** `{cfg.host}:{show_port}`"
             embed.add_field(name="Status", value=status_line, inline=False)
 
             motd = data.get("motd") or "—"
@@ -518,7 +541,7 @@ class MinecraftCog(commands.Cog):
         else:
             embed.add_field(
                 name="Status",
-                value=f"**Offline / Unreachable** `{cfg.host}:{cfg.port}`\n```{data.get('error','unknown error')}```",
+                value=f"**Offline / Unreachable** `{cfg.host}:{show_port}`\n```{data.get('error','unknown error')}```",
                 inline=False,
             )
 
@@ -533,28 +556,39 @@ class MinecraftCog(commands.Cog):
     @group.command(name="setup", description="Configure server connection + RCON")
     @app_commands.describe(
         kind="Minecraft edition: java or bedrock",
-        host="Server host or IP (no scheme)",
-        port="Server port",
+        host="Server host or domain",
+        port="Server port (optional; defaults 25565 Java / 19132 Bedrock)",
         rcon_host="RCON host (Java only)",
         rcon_port="RCON port (Java only)",
         rcon_password="RCON password (Java only)",
     )
-    @app_commands.choices(kind=[app_commands.Choice(name="java", value="java"), app_commands.Choice(name="bedrock", value="bedrock")])
+    @app_commands.choices(kind=[
+        app_commands.Choice(name="java", value="java"),
+        app_commands.Choice(name="bedrock", value="bedrock")
+    ])
     @app_commands.checks.has_permissions(manage_guild=True)
     async def setup(
         self,
         interaction: discord.Interaction,
         kind: app_commands.Choice[str],
         host: str,
-        port: int,
+        port: Optional[int] = None,
         rcon_host: Optional[str] = None,
         rcon_port: Optional[int] = None,
         rcon_password: Optional[str] = None,
     ):
+        # fill default port if none provided
+        if port is None:
+            port = default_port_for(kind.value)
+
         gid = str(interaction.guild_id)
         self.configs[gid] = ServerConfig(
-            kind=kind.value, host=host, port=port,
-            rcon_host=rcon_host, rcon_port=rcon_port, rcon_password=rcon_password,
+            kind=kind.value,
+            host=host,
+            port=port,
+            rcon_host=rcon_host,
+            rcon_port=rcon_port,
+            rcon_password=rcon_password,
         )
         save_all_configs(self.configs)
         await interaction.response.send_message(
@@ -588,8 +622,9 @@ class MinecraftCog(commands.Cog):
         if not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured. Set it in `/mc setup`.", ephemeral=True)
 
+        rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, msg = await rcon_stop_sequence(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password)
+        ok, msg = await rcon_stop_sequence(cfg.rcon_host, rp, cfg.rcon_password)
         if ok:
             await interaction.followup.send(
                 "✅ Restart sequence issued (server stopped).\n"
