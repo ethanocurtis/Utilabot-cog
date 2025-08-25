@@ -30,7 +30,6 @@ class ServerConfig:
     rcon_host: Optional[str] = None
     rcon_port: Optional[int] = None
     rcon_password: Optional[str] = None
-    properties_path: Optional[str] = None   # path to server.properties (optional)
 
 
 def load_all_configs() -> Dict[str, ServerConfig]:
@@ -80,7 +79,7 @@ async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
                 "latency": None,
                 "players_online": status.players_online,
                 "players_max": status.players_max,
-                "sample": [],  # Bedrock ping doesn't provide names
+                "sample": [],  # Bedrock ping doesn't provide player samples
             }
             return True, data
 
@@ -90,45 +89,12 @@ async def mc_status(kind: str, host: str, port: int) -> Tuple[bool, Dict]:
         return False, {"error": str(e)}
 
 
-def read_properties(path: str) -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().splitlines()
-
-
-def write_properties(path: str, lines: List[str]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def set_property_line(lines: List[str], key: str, value: str) -> Tuple[List[str], bool]:
-    """
-    Replace or append 'key=value' in a typical server.properties file.
-    Preserves comments and unrelated lines. Returns (new_lines, replaced).
-    """
-    key_eq = f"{key}="
-    replaced = False
-    new_lines: List[str] = []
-    for line in lines:
-        if line.strip().startswith("#"):
-            new_lines.append(line)
-            continue
-        if line.startswith(key_eq):
-            new_lines.append(f"{key}={value}")
-            replaced = True
-        else:
-            new_lines.append(line)
-    if not replaced:
-        new_lines.append(f"{key}={value}")
-    return new_lines, replaced
-
-
 # =========================
 # RCON helpers (no thread)
 # =========================
 async def rcon_exec(host: str, port: int, password: str, command: str) -> Tuple[bool, str]:
     """
-    Execute a command via RCON. Run synchronously in the event loop thread.
-    (mcrcon uses signal handlers that can fail in thread pools.)
+    Execute a command via RCON in the event loop thread (mcrcon's signals can break in thread pools).
     """
     try:
         with MCRcon(host, password, port=port) as rcon:
@@ -156,335 +122,246 @@ async def rcon_stop_sequence(host: str, port: int, password: str, *, warn_secs: 
 
 
 # =========================
-# Modals for properties
+# Generic RCON command model
 # =========================
-class PropertyNumberModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, key: str, min_v: int, max_v: int, *, title: str):
-        super().__init__(title=title)
-        self.cog = cog
-        self.guild_id = guild_id
-        self.key = key
-        self.min_v = min_v
-        self.max_v = max_v
-
-        self.value = discord.ui.TextInput(
-            label=f"{key}",
-            placeholder=f"{min_v}–{max_v}",
-            required=True,
-            min_length=1,
-            max_length=5,
-        )
-        self.add_item(self.value)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.properties_path:
-            return await interaction.response.send_message("⚠️ No properties path configured.", ephemeral=True)
-
-        try:
-            n = int(str(self.value.value).strip())
-        except ValueError:
-            return await interaction.response.send_message("Please enter a valid number.", ephemeral=True)
-        if not (self.min_v <= n <= self.max_v):
-            return await interaction.response.send_message(
-                f"Value must be between {self.min_v} and {self.max_v}.", ephemeral=True
-            )
-        try:
-            lines = read_properties(cfg.properties_path)
-            new_lines, _ = set_property_line(lines, self.key, str(n))
-            write_properties(cfg.properties_path, new_lines)
-            await interaction.response.send_message(
-                f"✅ `{self.key}` updated to **{n}** in `server.properties`.\n"
-                f"🔁 Restart the server for changes to take effect.",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to update: `{e}`", ephemeral=True)
+class RconCmd:
+    def __init__(self, key: str, label: str, template: str, fields: Optional[List[Dict]] = None, danger: bool = False):
+        self.key = key            # unique id
+        self.label = label        # dropdown label
+        self.template = template  # template like "ban {name} {reason}"
+        self.fields = fields or []  # [{"id","label","placeholder","min","max","required"}]
+        self.danger = danger
 
 
-class PropertyBooleanModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, key: str, *, title: str):
-        super().__init__(title=title)
-        self.cog = cog
-        self.guild_id = guild_id
-        self.key = key
+RCON_COMMANDS: List[RconCmd] = [
+    # Info / chat
+    RconCmd("list", "Player list", "list"),
+    RconCmd("say", "Broadcast message", "say {msg}", fields=[{"id": "msg", "label": "Message", "placeholder": "Server restarting soon!", "min":1, "max":200, "required": True}]),
 
-        self.value = discord.ui.TextInput(
-            label=f"{key}",
-            placeholder="true or false",
-            required=True,
-            min_length=4,
-            max_length=5,
-        )
-        self.add_item(self.value)
+    # Whitelist
+    RconCmd("wl_on", "Whitelist ON", "whitelist on"),
+    RconCmd("wl_off", "Whitelist OFF", "whitelist off"),
+    RconCmd("wl_add", "Whitelist add <name>", "whitelist add {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
+    RconCmd("wl_remove", "Whitelist remove <name>", "whitelist remove {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
+    RconCmd("wl_list", "Whitelist list", "whitelist list"),
 
-    async def on_submit(self, interaction: discord.Interaction):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.properties_path:
-            return await interaction.response.send_message("⚠️ No properties path configured.", ephemeral=True)
+    # Permissions
+    RconCmd("op", "OP <name>", "op {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
+    RconCmd("deop", "DEOP <name>", "deop {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
 
-        val = str(self.value.value).strip().lower()
-        if val not in {"true", "false"}:
-            return await interaction.response.send_message("Enter `true` or `false`.", ephemeral=True)
-        try:
-            lines = read_properties(cfg.properties_path)
-            new_lines, _ = set_property_line(lines, self.key, val)
-            write_properties(cfg.properties_path, new_lines)
-            await interaction.response.send_message(
-                f"✅ `{self.key}` updated to **{val}** in `server.properties`.\n"
-                f"🔁 Restart the server for changes to take effect.",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to update: `{e}`", ephemeral=True)
+    # Moderation
+    RconCmd("kick", "Kick <name> [reason]", "kick {name} {reason}", fields=[
+        {"id":"name","label":"Player name","placeholder":"Griefer123","min":2,"max":16,"required":True},
+        {"id":"reason","label":"Reason (optional)","placeholder":"Keep it short","min":0,"max":60,"required":False},
+    ]),
+    RconCmd("ban", "Ban <name> [reason]", "ban {name} {reason}", fields=[
+        {"id":"name","label":"Player name","placeholder":"Griefer123","min":2,"max":16,"required":True},
+        {"id":"reason","label":"Reason (optional)","placeholder":"Griefing","min":0,"max":60,"required":False},
+    ]),
+    RconCmd("pardon", "Pardon <name>", "pardon {name}", fields=[{"id":"name","label":"Player name","placeholder":"Friend","min":2,"max":16,"required":True}]),
 
+    # Gameplay settings (live; these three are handled by choice views, not text)
+    RconCmd("difficulty", "Difficulty (pick)", "difficulty {level}"),
+    RconCmd("gamemode", "Default gamemode (pick)", "defaultgamemode {mode}"),
+    RconCmd("weather", "Weather (pick)", "weather {kind}"),
 
-class PropertyStringModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, key: str, *, title: str, max_len: int = 80):
-        super().__init__(title=title)
-        self.cog = cog
-        self.guild_id = guild_id
-        self.key = key
-        self.value = discord.ui.TextInput(
-            label=f"{key}",
-            placeholder="Enter text (colors okay, e.g., §aHello!)",
-            required=True,
-            min_length=1,
-            max_length=max_len,
-        )
-        self.add_item(self.value)
+    # Time presets (handled by buttons)
+    RconCmd("time", "Time set (pick)", "time set {value}"),
 
-    async def on_submit(self, interaction: discord.Interaction):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.properties_path:
-            return await interaction.response.send_message("⚠️ No properties path configured.", ephemeral=True)
+    # Gamerule presets (handled by a dedicated UI)
+    RconCmd("gamerule_preset", "Gamerule presets (pick/toggle)", "gamerule {rule} {value}"),
 
-        raw = str(self.value.value).rstrip("\n")
-        # server.properties needs escaping for some characters; keep it simple here.
-        safe = raw.replace("\n", " ").strip()
-        try:
-            lines = read_properties(cfg.properties_path)
-            new_lines, _ = set_property_line(lines, self.key, safe)
-            write_properties(cfg.properties_path, new_lines)
-            await interaction.response.send_message(
-                f"✅ `{self.key}` updated in `server.properties`.\n"
-                f"🔁 Restart the server for changes to take effect.",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to update: `{e}`", ephemeral=True)
+    # Utility
+    RconCmd("tp", "Teleport <target> <destination>", "tp {target} {dest}", fields=[
+        {"id":"target","label":"Target selector or player","placeholder":"Player | @a | @p","min":1,"max":32,"required":True},
+        {"id":"dest","label":"Destination","placeholder":"Player | x y z","min":1,"max":64,"required":True},
+    ]),
+    RconCmd("title", "Title all players", 'title @a title {"text":"{text}"}', fields=[{"id":"text","label":"Title text","placeholder":"Welcome!","min":1,"max":100,"required":True}]),
+    RconCmd("save_flush", "Save-all flush", "save-all flush"),
+    RconCmd("save_on", "Save-on", "save-on"),
+    RconCmd("save_off", "Save-off", "save-off"),
+
+    # Power
+    RconCmd("stop", "STOP server (confirm)", "stop", danger=True),
+]
 
 
 # =========================
-# Views (UI)
+# UI: Pre-filled choice views
 # =========================
-class DifficultyView(discord.ui.View):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, timeout: Optional[float] = 60):
-        super().__init__(timeout=timeout); self.cog = cog; self.guild_id = guild_id
+class DifficultyChoiceView(discord.ui.View):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(timeout=60); self.cog=cog; self.guild_id=guild_id
 
-    @discord.ui.button(label="Peaceful", style=discord.ButtonStyle.secondary, emoji="🕊️")
-    async def peaceful(self, interaction: discord.Interaction, _): await self._set(interaction, "peaceful")
-    @discord.ui.button(label="Easy", style=discord.ButtonStyle.secondary, emoji="🙂")
-    async def easy(self, interaction: discord.Interaction, _): await self._set(interaction, "easy")
-    @discord.ui.button(label="Normal", style=discord.ButtonStyle.primary, emoji="😎")
-    async def normal(self, interaction: discord.Interaction, _): await self._set(interaction, "normal")
-    @discord.ui.button(label="Hard", style=discord.ButtonStyle.danger, emoji="🔥")
-    async def hard(self, interaction: discord.Interaction, _): await self._set(interaction, "hard")
-
-    async def _set(self, interaction: discord.Interaction, value: str):
+    async def _run(self, interaction: discord.Interaction, value: str):
         cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.rcon_host or not cfg.rcon_port or not cfg.rcon_password:
+        if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"difficulty {value}")
         await interaction.followup.send((f"✅ Difficulty set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
+    @discord.ui.button(label="Peaceful", style=discord.ButtonStyle.secondary, emoji="🕊️")
+    async def peaceful(self, i: discord.Interaction, _): await self._run(i, "peaceful")
+    @discord.ui.button(label="Easy", style=discord.ButtonStyle.secondary, emoji="🙂")
+    async def easy(self, i: discord.Interaction, _): await self._run(i, "easy")
+    @discord.ui.button(label="Normal", style=discord.ButtonStyle.primary, emoji="😎")
+    async def normal(self, i: discord.Interaction, _): await self._run(i, "normal")
+    @discord.ui.button(label="Hard", style=discord.ButtonStyle.danger, emoji="🔥")
+    async def hard(self, i: discord.Interaction, _): await self._run(i, "hard")
 
-class GamemodeView(discord.ui.View):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, timeout: Optional[float] = 60):
-        super().__init__(timeout=timeout); self.cog = cog; self.guild_id = guild_id
 
-    @discord.ui.button(label="Survival", style=discord.ButtonStyle.secondary, emoji="⛏️")
-    async def survival(self, interaction: discord.Interaction, _): await self._set(interaction, "survival")
-    @discord.ui.button(label="Creative", style=discord.ButtonStyle.primary, emoji="📦")
-    async def creative(self, interaction: discord.Interaction, _): await self._set(interaction, "creative")
-    @discord.ui.button(label="Adventure", style=discord.ButtonStyle.secondary, emoji="🧭")
-    async def adventure(self, interaction: discord.Interaction, _): await self._set(interaction, "adventure")
-    @discord.ui.button(label="Spectator", style=discord.ButtonStyle.secondary, emoji="👁️")
-    async def spectator(self, interaction: discord.Interaction, _): await self._set(interaction, "spectator")
+class GamemodeChoiceView(discord.ui.View):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(timeout=60); self.cog=cog; self.guild_id=guild_id
 
-    async def _set(self, interaction: discord.Interaction, value: str):
+    async def _run(self, interaction: discord.Interaction, value: str):
         cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or not cfg.rcon_host or not cfg.rcon_port or not cfg.rcon_password:
+        if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"defaultgamemode {value}")
         await interaction.followup.send((f"✅ Default gamemode set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
+    @discord.ui.button(label="Survival", style=discord.ButtonStyle.secondary, emoji="⛏️")
+    async def survival(self, i: discord.Interaction, _): await self._run(i, "survival")
+    @discord.ui.button(label="Creative", style=discord.ButtonStyle.primary, emoji="📦")
+    async def creative(self, i: discord.Interaction, _): await self._run(i, "creative")
+    @discord.ui.button(label="Adventure", style=discord.ButtonStyle.secondary, emoji="🧭")
+    async def adventure(self, i: discord.Interaction, _): await self._run(i, "adventure")
+    @discord.ui.button(label="Spectator", style=discord.ButtonStyle.secondary, emoji="👁️")
+    async def spectator(self, i: discord.Interaction, _): await self._run(i, "spectator")
 
-class WhitelistToggleView(discord.ui.View):
-    """Simple ON/OFF toggle for whitelist."""
-    def __init__(self, cog: "MinecraftCog", guild_id: int, timeout: Optional[float] = 60):
-        super().__init__(timeout=timeout); self.cog = cog; self.guild_id = guild_id
 
-    @discord.ui.button(label="Whitelist ON", style=discord.ButtonStyle.success, emoji="✅")
-    async def wl_on(self, interaction: discord.Interaction, _): await self._toggle(interaction, True)
+class WeatherChoiceView(discord.ui.View):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(timeout=60); self.cog=cog; self.guild_id=guild_id
 
-    @discord.ui.button(label="Whitelist OFF", style=discord.ButtonStyle.danger, emoji="❌")
-    async def wl_off(self, interaction: discord.Interaction, _): await self._toggle(interaction, False)
+    async def _run(self, interaction: discord.Interaction, kind: str):
+        cfg = self.cog.configs.get(str(self.guild_id))
+        if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"weather {kind}")
+        await interaction.followup.send((f"✅ Weather set to **{kind}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
 
-    async def _toggle(self, interaction: discord.Interaction, turn_on: bool):
+    @discord.ui.button(label="Clear", style=discord.ButtonStyle.success, emoji="☀️")
+    async def clear(self, i: discord.Interaction, _): await self._run(i, "clear")
+    @discord.ui.button(label="Rain", style=discord.ButtonStyle.secondary, emoji="🌧️")
+    async def rain(self, i: discord.Interaction, _): await self._run(i, "rain")
+    @discord.ui.button(label="Thunder", style=discord.ButtonStyle.danger, emoji="⛈️")
+    async def thunder(self, i: discord.Interaction, _): await self._run(i, "thunder")
+
+
+class TimeChoiceView(discord.ui.View):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(timeout=60); self.cog=cog; self.guild_id=guild_id
+
+    async def _run(self, interaction: discord.Interaction, value: str):
+        cfg = self.cog.configs.get(str(self.guild_id))
+        if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"time set {value}")
+        await interaction.followup.send((f"✅ Time set to **{value}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
+
+    @discord.ui.button(label="Day", style=discord.ButtonStyle.secondary, emoji="🌤️")
+    async def day(self, i: discord.Interaction, _): await self._run(i, "day")
+    @discord.ui.button(label="Noon", style=discord.ButtonStyle.secondary, emoji="🌞")
+    async def noon(self, i: discord.Interaction, _): await self._run(i, "noon")
+    @discord.ui.button(label="Night", style=discord.ButtonStyle.primary, emoji="🌙")
+    async def night(self, i: discord.Interaction, _): await self._run(i, "night")
+    @discord.ui.button(label="Midnight", style=discord.ButtonStyle.danger, emoji="🌌")
+    async def midnight(self, i: discord.Interaction, _): await self._run(i, "midnight")
+
+
+# A small list of popular gamerules to toggle quickly
+GAMERULE_PRESETS = [
+    ("keepInventory", ["true", "false"]),
+    ("doDaylightCycle", ["true", "false"]),
+    ("doWeatherCycle", ["true", "false"]),
+    ("doMobGriefing", ["true", "false"]),
+    ("doFireTick", ["true", "false"]),
+    ("doImmediateRespawn", ["true", "false"]),
+    ("showCoordinates", ["true", "false"]),  # Bedrock-ism, harmless if not found
+]
+
+class GamerulePresetView(discord.ui.View):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        super().__init__(timeout=90); self.cog=cog; self.guild_id=guild_id
+        self.add_item(GameruleSelect(cog, guild_id))
+        self.add_item(GameruleValueSelect(cog, guild_id))
+
+class GameruleSelect(discord.ui.Select):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        self.cog=cog; self.guild_id=guild_id
+        options = [discord.SelectOption(label=name, value=name) for name, _ in GAMERULE_PRESETS]
+        super().__init__(placeholder="Choose gamerule…", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        # store selection on the view
+        self.view.selected_rule = self.values[0]
+        await interaction.response.send_message(f"Rule selected: `{self.view.selected_rule}`. Now pick a value.", ephemeral=True)
+
+class GameruleValueSelect(discord.ui.Select):
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        self.cog=cog; self.guild_id=guild_id
+        options = [discord.SelectOption(label="true", value="true"), discord.SelectOption(label="false", value="false")]
+        super().__init__(placeholder="Set value…", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        cfg = self.cog.configs.get(str(self.guild_id))
+        if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
+
+        rule = getattr(self.view, "selected_rule", None)
+        if not rule:
+            return await interaction.response.send_message("Pick a gamerule first.", ephemeral=True)
+
+        value = self.values[0]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"gamerule {rule} {value}")
+        await interaction.followup.send((f"✅ `gamerule {rule} {value}`\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
+
+
+# =========================
+# UI: Generic modal for commands with fields
+# =========================
+class CommandModal(discord.ui.Modal):
+    def __init__(self, cog: "MinecraftCog", guild_id: int, cmd: RconCmd):
+        super().__init__(title=f"Run: {cmd.label}")
+        self.cog = cog
+        self.guild_id = guild_id
+        self.cmd = cmd
+        self.inputs: Dict[str, discord.ui.TextInput] = {}
+        for f in cmd.fields:
+            ti = discord.ui.TextInput(
+                label=f["label"],
+                placeholder=f.get("placeholder", ""),
+                required=f.get("required", True),
+                min_length=f.get("min", None),
+                max_length=f.get("max", None),
+            )
+            self.inputs[f["id"]] = ti
+            self.add_item(ti)
+
+    async def on_submit(self, interaction: discord.Interaction):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ Java + RCON required and must be configured.", ephemeral=True)
+
+        values = {fid: (str(inp.value).strip() if inp.value is not None else "") for fid, inp in self.inputs.items()}
+        command = self.cmd.template.format(**values).strip()
+
         await interaction.response.defer(ephemeral=True, thinking=True)
-        cmd = "whitelist on" if turn_on else "whitelist off"
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, cmd)
-        msg = f"✅ Whitelist **{'ON' if turn_on else 'OFF'}**.\n```{resp}```" if ok else f"❌ Failed: `{resp}`"
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, command)
+        msg = f"✅ Ran `{command}`.\n```{resp}```" if ok else f"❌ `{command}` failed:\n`{resp}`"
         await interaction.followup.send(msg, ephemeral=True)
 
 
-class WhitelistAddModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int):
-        super().__init__(title="Add player to whitelist")
-        self.cog = cog; self.guild_id = guild_id
-        self.name = discord.ui.TextInput(label="Java Username", placeholder="e.g., Notch", required=True, min_length=2, max_length=16)
-        self.add_item(self.name)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
-            return await interaction.response.send_message("⚠️ Java + RCON required.", ephemeral=True)
-        username = str(self.name.value).strip()
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"whitelist add {username}")
-        msg = f"✅ **{username}** added to whitelist.\n```{resp}```" if ok else f"❌ Failed to add: `{resp}`"
-        await interaction.followup.send(msg, ephemeral=True)
-
-
-class WhitelistRemoveModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int):
-        super().__init__(title="Remove player from whitelist")
-        self.cog = cog; self.guild_id = guild_id
-        self.name = discord.ui.TextInput(label="Java Username", placeholder="e.g., Notch", required=True, min_length=2, max_length=16)
-        self.add_item(self.name)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
-            return await interaction.response.send_message("⚠️ Java + RCON required.", ephemeral=True)
-        username = str(self.name.value).strip()
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, f"whitelist remove {username}")
-        msg = f"✅ **{username}** removed from whitelist.\n```{resp}```" if ok else f"❌ Failed to remove: `{resp}`"
-        await interaction.followup.send(msg, ephemeral=True)
-
-
-class WhitelistManagerView(discord.ui.View):
-    """Manager with Add / Remove / List actions."""
-    def __init__(self, cog: "MinecraftCog", guild_id: int, timeout: Optional[int] = 90):
-        super().__init__(timeout=timeout)
-        self.cog = cog; self.guild_id = guild_id
-
-    @discord.ui.button(label="Add Player", style=discord.ButtonStyle.success, emoji="➕")
-    async def add_btn(self, interaction: discord.Interaction, _):
-        await interaction.response.send_modal(WhitelistAddModal(self.cog, self.guild_id))
-
-    @discord.ui.button(label="Remove Player", style=discord.ButtonStyle.danger, emoji="➖")
-    async def remove_btn(self, interaction: discord.Interaction, _):
-        await interaction.response.send_modal(WhitelistRemoveModal(self.cog, self.guild_id))
-
-    @discord.ui.button(label="Show List", style=discord.ButtonStyle.secondary, emoji="📜")
-    async def list_btn(self, interaction: discord.Interaction, _):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
-            return await interaction.response.send_message("⚠️ Java + RCON required.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, "whitelist list")
-        if not ok:
-            return await interaction.followup.send(f"❌ Failed to list: `{resp}`", ephemeral=True)
-
-        text = resp.strip()
-        names: List[str] = []
-        if ":" in text:
-            names_part = text.split(":", 1)[1].strip()
-            if names_part:
-                names = [n.strip() for n in names_part.split(",") if n.strip()]
-        if not names and text:
-            names = [n.strip(",") for n in text.split() if n and n.lower() not in {"there", "are", "whitelisted", "players"}]
-
-        if not names:
-            return await interaction.followup.send("ℹ️ Whitelist appears to be **empty**.", ephemeral=True)
-
-        chunks = [names[i:i+20] for i in range(0, len(names), 20)]
-        embed = discord.Embed(title="Whitelisted Players", color=discord.Color.green())
-        for idx, chunk in enumerate(chunks, 1):
-            embed.add_field(name=f"Page {idx}", value=", ".join(chunk), inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-class SettingsSelect(discord.ui.Select):
-    """Dropdown to choose which setting to change."""
-    def __init__(self, cog: "MinecraftCog", guild_id: int):
-        self.cog = cog
-        self.guild_id = guild_id
-        options = [
-            # Instant (RCON)
-            discord.SelectOption(label="Difficulty", description="Peaceful/Easy/Normal/Hard (instant)", value="difficulty", emoji="⚔️"),
-            discord.SelectOption(label="Default Gamemode", description="Survival/Creative/Adventure/Spectator (instant)", value="defaultgamemode", emoji="🎮"),
-            discord.SelectOption(label="Whitelist ON/OFF", description="Toggle whitelist (instant)", value="whitelist", emoji="✅"),
-            # Properties (restart required)
-            discord.SelectOption(label="view-distance", description="2–32 (restart)", value="view-distance", emoji="🗺️"),
-            discord.SelectOption(label="max-players", description="1–200 (restart)", value="max-players", emoji="👥"),
-            discord.SelectOption(label="spawn-protection", description="0–64 (restart)", value="spawn-protection", emoji="🛡️"),
-            discord.SelectOption(label="allow-flight", description="true/false (restart)", value="allow-flight", emoji="🪽"),
-            discord.SelectOption(label="pvp", description="true/false (restart)", value="pvp", emoji="⚔️"),
-            discord.SelectOption(label="enforce-whitelist", description="true/false (restart)", value="enforce-whitelist", emoji="🧾"),
-            discord.SelectOption(label="online-mode", description="true/false (restart)", value="online-mode", emoji="🌐"),
-            discord.SelectOption(label="motd", description="Server MOTD text (restart)", value="motd", emoji="🪧"),
-        ]
-        super().__init__(placeholder="Choose a setting to change…", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        value = self.values[0]
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg:
-            return await interaction.response.send_message("⚠️ This server isn't configured. Run `/mc setup` first.", ephemeral=True)
-
-        # Instant settings (RCON)
-        if value == "difficulty":
-            return await interaction.response.send_message("Pick a difficulty:", view=DifficultyView(self.cog, self.guild_id), ephemeral=True)
-
-        if value == "defaultgamemode":
-            return await interaction.response.send_message("Pick a default gamemode:", view=GamemodeView(self.cog, self.guild_id), ephemeral=True)
-
-        if value == "whitelist":
-            return await interaction.response.send_message("Toggle whitelist:", view=WhitelistToggleView(self.cog, self.guild_id), ephemeral=True)
-
-        # Properties require a path
-        if not cfg.properties_path:
-            return await interaction.response.send_message(
-                "⚠️ No `server.properties` path set in `/mc setup`.\nRe-run setup with `properties_path` to enable property editing.",
-                ephemeral=True,
-            )
-
-        # Numeric props
-        if value == "view-distance":
-            return await interaction.response.send_modal(PropertyNumberModal(self.cog, self.guild_id, "view-distance", 2, 32, title="Set view-distance (2–32)"))
-        if value == "max-players":
-            return await interaction.response.send_modal(PropertyNumberModal(self.cog, self.guild_id, "max-players", 1, 200, title="Set max-players (1–200)"))
-        if value == "spawn-protection":
-            return await interaction.response.send_modal(PropertyNumberModal(self.cog, self.guild_id, "spawn-protection", 0, 64, title="Set spawn-protection (0–64)"))
-
-        # Boolean props
-        if value in {"allow-flight", "pvp", "enforce-whitelist", "online-mode"}:
-            return await interaction.response.send_modal(PropertyBooleanModal(self.cog, self.guild_id, value, title=f"Set {value} (true/false)"))
-
-        # String props
-        if value == "motd":
-            return await interaction.response.send_modal(PropertyStringModal(self.cog, self.guild_id, "motd", title="Set motd", max_len=120))
-
-
+# =========================
+# Other views
+# =========================
 class ConfirmStopView(discord.ui.View):
     def __init__(self, cog: "MinecraftCog", guild_id: int, *, restart_hint: bool = False, timeout: int = 20):
         super().__init__(timeout=timeout)
@@ -510,11 +387,63 @@ class ConfirmStopView(discord.ui.View):
         self.stop()
 
 
+class RconSelect(discord.ui.Select):
+    """Dropdown of RCON commands; opens a choice view or modal if needed."""
+    def __init__(self, cog: "MinecraftCog", guild_id: int):
+        self.cog = cog
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(label=cmd.label, value=cmd.key, emoji=("❗" if cmd.danger else "🧰"))
+            for cmd in RCON_COMMANDS
+        ]
+        super().__init__(placeholder="Run an RCON command…", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        cmd_key = self.values[0]
+        cmd = next((c for c in RCON_COMMANDS if c.key == cmd_key), None)
+        if not cmd:
+            return await interaction.response.send_message("Unknown command.", ephemeral=True)
+
+        cfg = self.cog.configs.get(str(self.guild_id))
+        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+            return await interaction.response.send_message("⚠️ Java + RCON required and must be configured.", ephemeral=True)
+
+        # Pre-filled choice UIs
+        if cmd.key == "difficulty":
+            return await interaction.response.send_message("Pick a difficulty:", view=DifficultyChoiceView(self.cog, self.guild_id), ephemeral=True)
+        if cmd.key == "gamemode":
+            return await interaction.response.send_message("Pick a default gamemode:", view=GamemodeChoiceView(self.cog, self.guild_id), ephemeral=True)
+        if cmd.key == "weather":
+            return await interaction.response.send_message("Pick the weather:", view=WeatherChoiceView(self.cog, self.guild_id), ephemeral=True)
+        if cmd.key == "time":
+            return await interaction.response.send_message("Pick a time:", view=TimeChoiceView(self.cog, self.guild_id), ephemeral=True)
+        if cmd.key == "gamerule_preset":
+            return await interaction.response.send_message("Gamerule presets:", view=GamerulePresetView(self.cog, self.guild_id), ephemeral=True)
+
+        # Danger commands get a confirm
+        if cmd.danger:
+            return await interaction.response.send_message(
+                "Are you sure you want to **stop** the server? (save-all + stop)",
+                view=ConfirmStopView(self.cog, self.guild_id, restart_hint=True),
+                ephemeral=True,
+            )
+
+        # Commands with fields → open modal
+        if cmd.fields:
+            return await interaction.response.send_modal(CommandModal(self.cog, self.guild_id, cmd))
+
+        # No fields → run immediately
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, resp = await rcon_exec(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password, cmd.template)
+        msg = f"✅ Ran `{cmd.template}`.\n```{resp}```" if ok else f"❌ `{cmd.template}` failed:\n`{resp}`"
+        await interaction.followup.send(msg, ephemeral=True)
+
+
 class PanelView(discord.ui.View):
     def __init__(self, cog: "MinecraftCog", guild_id: int, *, timeout: Optional[float] = 300):
         super().__init__(timeout=timeout)
         self.cog = cog; self.guild_id = guild_id
-        self.add_item(SettingsSelect(cog, guild_id))
+        self.add_item(RconSelect(cog, guild_id))
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄")
     async def refresh(self, interaction: discord.Interaction, _):
@@ -529,12 +458,7 @@ class PanelView(discord.ui.View):
             return await interaction.response.send_message("No config found.", ephemeral=True)
         await interaction.response.send_message(f"`{cfg.host}:{cfg.port}` (for **{cfg.kind.upper()}**)", ephemeral=True)
 
-    @discord.ui.button(label="Whitelist", style=discord.ButtonStyle.secondary, emoji="👤")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def wl_manage(self, interaction: discord.Interaction, _):
-        await interaction.response.send_message("Whitelist manager:", view=WhitelistManagerView(self.cog, self.guild_id), ephemeral=True)
-
-    @discord.ui.button(label="Restart", style=discord.ButtonStyle.danger, emoji="🟧")
+    @discord.ui.button(label="Restart (stop)", style=discord.ButtonStyle.danger, emoji="🟧")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def restart_btn(self, interaction: discord.Interaction, _):
         await interaction.response.send_message(
@@ -543,21 +467,12 @@ class PanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="🟥")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def stop_btn(self, interaction: discord.Interaction, _):
-        await interaction.response.send_message(
-            "Are you sure you want to **stop** the server?\nThis will run `save-all` and `stop`.",
-            view=ConfirmStopView(self.cog, self.guild_id, restart_hint=False),
-            ephemeral=True,
-        )
-
 
 # =========================
 # Main Cog
 # =========================
 class MinecraftCog(commands.Cog):
-    """Interactive Minecraft status & control panel (Java/Bedrock + RCON + properties)."""
+    """Minecraft RCON control panel (Java/Bedrock status + rich RCON command runner)."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -570,7 +485,7 @@ class MinecraftCog(commands.Cog):
 
         embed = discord.Embed(
             title="🟩 Minecraft Server Panel" if cfg else "Minecraft Server Panel",
-            description="Live status • controls • quick actions",
+            description="Live status • RCON controls",
             color=discord.Color.blurple(),
         )
         embed.set_thumbnail(url="https://static.wikia.nocookie.net/minecraft_gamepedia/images/5/51/Grass_Block_JE2_BE2.png")
@@ -608,23 +523,21 @@ class MinecraftCog(commands.Cog):
             )
 
         hints: List[str] = []
-        hints.append("RCON ready" if (cfg.rcon_host and cfg.rcon_port) else "RCON not set")
-        hints.append("properties editing enabled" if cfg.properties_path else "properties editing not set")
+        hints.append("RCON ready" if (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password) else "RCON not set")
         embed.set_footer(text=" • ".join(hints))
         return embed
 
     # ---------- slash commands ----------
     group = app_commands.Group(name="mc", description="Minecraft server controls")
 
-    @group.command(name="setup", description="Configure server connection + optional RCON + properties path")
+    @group.command(name="setup", description="Configure server connection + RCON")
     @app_commands.describe(
         kind="Minecraft edition: java or bedrock",
         host="Server host or IP (no scheme)",
         port="Server port",
-        rcon_host="RCON host (optional, Java only)",
-        rcon_port="RCON port (optional, Java only)",
-        rcon_password="RCON password (optional, Java only)",
-        properties_path="Full path to server.properties (optional)",
+        rcon_host="RCON host (Java only)",
+        rcon_port="RCON port (Java only)",
+        rcon_password="RCON password (Java only)",
     )
     @app_commands.choices(kind=[app_commands.Choice(name="java", value="java"), app_commands.Choice(name="bedrock", value="bedrock")])
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -637,51 +550,34 @@ class MinecraftCog(commands.Cog):
         rcon_host: Optional[str] = None,
         rcon_port: Optional[int] = None,
         rcon_password: Optional[str] = None,
-        properties_path: Optional[str] = None,
     ):
         gid = str(interaction.guild_id)
         self.configs[gid] = ServerConfig(
             kind=kind.value, host=host, port=port,
             rcon_host=rcon_host, rcon_port=rcon_port, rcon_password=rcon_password,
-            properties_path=properties_path,
         )
         save_all_configs(self.configs)
         await interaction.response.send_message(
             "✅ Minecraft configuration saved for this server.\n"
             f"- Kind: **{kind.value}**\n"
             f"- Address: `{host}:{port}`\n"
-            f"- RCON: {'configured' if (rcon_host and rcon_port and rcon_password) else 'not set'}\n"
-            f"- Properties: `{properties_path or 'not set'}`",
+            f"- RCON: {'configured' if (rcon_host and rcon_port and rcon_password) else 'not set'}",
             ephemeral=True,
         )
 
-    @group.command(name="status", description="Show live status and player info")
+    @group.command(name="status", description="Show live status and open the RCON panel")
     async def status(self, interaction: discord.Interaction):
         await interaction.response.defer()
         embed = await self.build_status_embed(interaction.guild_id)
         await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id))
 
-    @group.command(name="panel", description="Open interactive controls (dropdown + buttons)")
+    @group.command(name="panel", description="Open the interactive RCON panel")
     async def panel(self, interaction: discord.Interaction):
         await interaction.response.defer()
         embed = await self.build_status_embed(interaction.guild_id)
         await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id))
 
-    # ---------- RCON-only Stop / Restart ----------
-    @group.command(name="stop", description="Gracefully stop the Java server via RCON (save-all + stop)")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def cmd_stop(self, interaction: discord.Interaction):
-        gid = str(interaction.guild_id)
-        cfg = self.configs.get(gid)
-        if not cfg or cfg.kind != "java":
-            return await interaction.response.send_message("⚠️ Stop is available for **Java** servers with RCON configured.", ephemeral=True)
-        if not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
-            return await interaction.response.send_message("⚠️ RCON not configured. Set it in `/mc setup`.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, msg = await rcon_stop_sequence(cfg.rcon_host, cfg.rcon_port, cfg.rcon_password)
-        await interaction.followup.send("✅ Stop issued." if ok else f"❌ Stop failed: `{msg}`", ephemeral=True)
-
+    # Convenience: soft restart via RCON stop
     @group.command(name="restart", description="Soft restart via RCON (save-all + stop). Requires external auto-restart.")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def cmd_restart(self, interaction: discord.Interaction):
@@ -697,7 +593,7 @@ class MinecraftCog(commands.Cog):
         if ok:
             await interaction.followup.send(
                 "✅ Restart sequence issued (server stopped).\n"
-                "ℹ️ Make sure Docker/systemd/screen auto-restarts the server process.",
+                "ℹ️ Make sure Docker/systemd/Pterodactyl auto-restarts the server process.",
                 ephemeral=True,
             )
         else:
