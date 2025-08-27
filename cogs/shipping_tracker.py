@@ -1,6 +1,7 @@
 # cogs/shipping_tracker.py
-# Discord Cog: Shipping Tracker (FedEx, USPS, UPS) with per-user storage, auto-updates, stats, and autocomplete.
-# Now with strict-provider option and no-spam notifications.
+# Shipping Tracker (FedEx/UPS/USPS) with per-user storage, auto-updates, stats, autocomplete,
+# strict-provider mode, and robust 429 rate-limit handling (global + per-tracking cooldowns).
+
 import os
 import re
 import json
@@ -51,14 +52,13 @@ def guess_carrier(number: str) -> Optional[str]:
         return "usps"
     return None
 
-# ---------- Providers ----------
+# ---------- Providers / Errors ----------
 class TrackingEvent:
     def __init__(self, status: str, description: str, time: Optional[str], location: Optional[str] = None):
         self.status = status
         self.description = description
         self.time = time
         self.location = location
-
     def to_dict(self):
         return {"status": self.status, "description": self.description, "time": self.time, "location": self.location}
 
@@ -73,6 +73,33 @@ class ProviderBase:
     async def fetch(self, carrier: str, tracking_number: str) -> TrackingResult:
         raise NotImplementedError
 
+class RateLimitError(Exception):
+    """Raised when the provider returns HTTP 429. Contains recommended retry epoch (UTC)."""
+    def __init__(self, retry_at: float, detail: str = "rate limited"):
+        super().__init__(detail)
+        self.retry_at = retry_at
+
+def _now_epoch():
+    return dt.datetime.utcnow().timestamp()
+
+def _parse_retry_at(headers: aiohttp.typedefs.LooseHeaders) -> float:
+    # Prefer Retry-After
+    ra = headers.get("Retry-After")
+    if ra:
+        try:
+            return _now_epoch() + float(ra)
+        except Exception:
+            pass
+    # Try common AfterShip/X-RateLimit-Reset (epoch seconds)
+    reset = headers.get("X-RateLimit-Reset") or headers.get("X-Ratelimit-Reset")
+    if reset:
+        try:
+            return float(reset)
+        except Exception:
+            pass
+    # Fallback: 60s
+    return _now_epoch() + 60.0
+
 class AfterShipProvider(ProviderBase):
     BASE = "https://api.aftership.com/v4"
     def __init__(self, api_key: str):
@@ -83,15 +110,21 @@ class AfterShipProvider(ProviderBase):
         url = f"{self.BASE}/trackings/{carrier}/{tracking_number}"
         async with aiohttp.ClientSession() as sess:
             async with sess.get(url, headers=headers, timeout=30) as resp:
+                if resp.status == 429:
+                    raise RateLimitError(_parse_retry_at(resp.headers))
                 if resp.status == 404:
-                    # Create then refetch
+                    # create then refetch
                     create_url = f"{self.BASE}/trackings"
                     payload = {"tracking": {"tracking_number": tracking_number, "slug": carrier}}
                     async with sess.post(create_url, headers=headers, json=payload, timeout=30) as cr:
+                        if cr.status == 429:
+                            raise RateLimitError(_parse_retry_at(cr.headers))
                         if cr.status not in (200, 201):
                             text = await cr.text()
                             raise RuntimeError(f"AfterShip create failed: {cr.status} {text}")
                     async with sess.get(url, headers=headers, timeout=30) as resp2:
+                        if resp2.status == 429:
+                            raise RateLimitError(_parse_retry_at(resp2.headers))
                         resp2.raise_for_status()
                         data = await resp2.json()
                 else:
@@ -108,8 +141,7 @@ class AfterShipProvider(ProviderBase):
             events.append(TrackingEvent(
                 status=cp.get("tag") or cp.get("subtag") or cp.get("message") or "Update",
                 description=cp.get("message") or cp.get("subtag_message") or cp.get("tag"),
-                time=ts,
-                location=loc or None,
+                time=ts, location=loc or None,
             ))
             if ts:
                 last_time = ts
@@ -118,11 +150,7 @@ class AfterShipProvider(ProviderBase):
         return TrackingResult(status=status, delivered=delivered, last_update=last_time, events=events)
 
 class FallbackWebProvider(ProviderBase):
-    FED_EX = "https://www.fedex.com/fedextrack/?trknbr={}"
-    UPS = "https://www.ups.com/track?loc=en_US&tracknum={}"
-    USPS = "https://tools.usps.com/go/TrackConfirmAction?tLabels={}"
     async def fetch(self, carrier: str, tracking_number: str) -> TrackingResult:
-        # We intentionally do not parse; just a heartbeat event.
         ev = TrackingEvent(
             status="Checked",
             description=f"Fetched public {carrier.upper()} page (parsing disabled).",
@@ -138,15 +166,17 @@ class ShippingTracker(commands.Cog):
         self.store = JsonStore(db_path)
 
         self.aftership_key = os.getenv("AFTERSHIP_API_KEY")
-        # Strict by default if you have an API key
         strict_default = "1" if self.aftership_key else "0"
         self.strict_provider = os.getenv("TRACKER_STRICT_PROVIDER", strict_default) == "1"
         self.disable_fallback = os.getenv("TRACKER_DISABLE_FALLBACK") == "1"
 
+        # Backoff tuning
+        self.min_per_tracking_cooldown = int(os.getenv("TRACKER_MIN_REFRESH_MINUTES", "30"))  # skip requery same tracking within this many minutes after 429
+        self.global_backoff_padding = int(os.getenv("TRACKER_RATE_LIMIT_BACKOFF_SEC", "60"))  # extra seconds added to provider's retry hint
+
         self.providers: List[ProviderBase] = []
         if self.aftership_key:
             self.providers.append(AfterShipProvider(self.aftership_key))
-            # Only add fallback if not strict and not explicitly disabled
             if not self.strict_provider and not self.disable_fallback:
                 self.providers.append(FallbackWebProvider())
         else:
@@ -154,6 +184,7 @@ class ShippingTracker(commands.Cog):
                 self.providers.append(FallbackWebProvider())
 
         self.poll_interval = int(os.getenv("TRACKER_POLL_MINUTES", "15"))
+        self._rl_global_until: Optional[float] = None  # epoch seconds when we may try again
         self._poller.start()
 
     def cog_unload(self):
@@ -168,10 +199,13 @@ class ShippingTracker(commands.Cog):
         for p in self.providers:
             try:
                 return await p.fetch(carrier, number)
+            except RateLimitError as rle:
+                # bubble up to caller so we can back off globally
+                raise rle
             except Exception as e:
                 last_exc = e
                 if self.strict_provider:
-                    break  # do not fall back when strict
+                    break
                 continue
         raise RuntimeError(f"All providers failed. Last error: {last_exc}")
 
@@ -236,16 +270,24 @@ class ShippingTracker(commands.Cog):
             "created_at": _now_iso(),
             "delivered_at": None,
             "last_status": "Unknown",
-            "last_update": None,   # keep None until provider gives a real timestamp
+            "last_update": None,
             "history": [],
             "notify_channel_id": channel.id if channel else None,
             "last_notified_hash": None,
+            "cooldown_until": None,  # epoch (float) when we can query again after 429
         }
         await self._save_user_doc(interaction.user.id, user_doc)
 
         try:
             res = await self.fetch_status(carrier, tracking_number)
             await self._apply_update(interaction.user, t_id, res, seed_only=True)
+        except RateLimitError as rle:
+            # seed saved; just inform user silently
+            await interaction.followup.send("Added. Provider is currently rate-limiting; updates will resume automatically.", ephemeral=True)
+            # set a conservative per-tracking cooldown too
+            user_doc["trackings"][t_id]["cooldown_until"] = rle.retry_at + self.global_backoff_padding
+            await self._save_user_doc(interaction.user.id, user_doc)
+            return
         except Exception as e:
             await interaction.followup.send(f"Saved tracking, but initial fetch failed: `{e}`", ephemeral=True)
             return
@@ -328,10 +370,18 @@ class ShippingTracker(commands.Cog):
             return
         ok = 0
         for tid, t in todo:
+            # Respect per-tracking cooldown
+            if t.get("cooldown_until") and _now_epoch() < float(t["cooldown_until"]):
+                continue
             try:
                 res = await self.fetch_status(t["carrier"], t["number"])
                 await self._apply_update(user, tid, res, notify=True)
                 ok += 1
+            except RateLimitError as rle:
+                # set both global and per-tracking cooldowns
+                self._rl_global_until = max(self._rl_global_until or 0.0, rle.retry_at + self.global_backoff_padding)
+                t["cooldown_until"] = rle.retry_at + (self.min_per_tracking_cooldown * 60)
+                await self._save_user_doc(user.id, user_doc)
             except Exception as e:
                 await interaction.followup.send(f"`{tid}` refresh failed: `{e}`", ephemeral=True)
         await interaction.followup.send(f"Refreshed {ok} tracking(s).", ephemeral=True)
@@ -381,9 +431,15 @@ class ShippingTracker(commands.Cog):
     @tasks.loop(minutes=15.0)
     async def _poller(self):
         await self.bot.wait_until_ready()
+
+        # Respect global cooldown (from prior 429)
+        if self._rl_global_until and _now_epoch() < self._rl_global_until:
+            return
+
         data = await self.store.read()
         users = data.get("users", {})
         for uid, udoc in users.items():
+            # get a member or user object
             member = None
             try:
                 for g in self.bot.guilds:
@@ -398,11 +454,22 @@ class ShippingTracker(commands.Cog):
             for tid, t in list(udoc.get("trackings", {}).items()):
                 if t.get("delivered_at"):
                     continue
+                # Per-tracking cooldown after 429
+                if t.get("cooldown_until") and _now_epoch() < float(t["cooldown_until"]):
+                    continue
                 try:
                     res = await self.fetch_status(t["carrier"], t["number"])
+                except RateLimitError as rle:
+                    # set global + per-tracking backoffs
+                    self._rl_global_until = max(self._rl_global_until or 0.0, rle.retry_at + self.global_backoff_padding)
+                    t["cooldown_until"] = rle.retry_at + (self.min_per_tracking_cooldown * 60)
+                    continue
                 except Exception:
                     continue
                 await self._apply_update(member, tid, res, notify=True)
+
+        # persist any cooldown updates
+        await self.store.write(data)
 
     @_poller.before_loop
     async def _before(self):
@@ -419,8 +486,7 @@ class ShippingTracker(commands.Cog):
         if not t:
             return False
 
-        # Build a stable change-hash:
-        # - do NOT inject current time if provider didn't give last_update
+        # Stable change hash (avoid spam)
         stable_last_update = res.last_update or t.get("last_update") or ""
         last_event = res.events[-1] if res.events else None
         last_desc = (last_event.description or "") if last_event else ""
@@ -428,11 +494,10 @@ class ShippingTracker(commands.Cog):
         if t.get("last_notified_hash") == new_hash and not seed_only:
             return False
 
-        # Merge state
         t["last_status"] = res.status
         if res.last_update:
-            t["last_update"] = res.last_update  # keep previous if None
-        # Append events with light de-dupe on (status, desc, time)
+            t["last_update"] = res.last_update
+        # De-dupe events
         seen = {(e.get("status"), e.get("description"), e.get("time")) for e in t.get("history", [])}
         for ev in res.events:
             key = (ev.status, ev.description, ev.time)
