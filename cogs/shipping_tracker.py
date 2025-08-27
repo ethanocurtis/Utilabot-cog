@@ -1,32 +1,6 @@
 # cogs/shipping_tracker.py
 # Discord Cog: Shipping Tracker (FedEx, USPS, UPS) with per-user storage, auto-updates, stats, and autocomplete.
-# Author: ChatGPT for Ethan
-#
-# Features:
-# - /track add <carrier|auto> <tracking_number> [nickname] [channel]
-# - /track list
-# - /track remove <id>              (tracking_id has autocomplete)
-# - /track info <id>                (tracking_id has autocomplete)
-# - /track refresh [id]             (tracking_id has autocomplete; optional)
-# - /track stats [year] [scope]
-# - Background poller that checks undelivered packages and posts updates until delivered.
-#
-# Storage:
-# - JSON at ./data/trackings.json (configurable via TRACKER_DB_PATH env)
-# - Per user entries; each tracking has history and notification preferences.
-#
-# Providers:
-# - AfterShip (recommended): set AFTERSHIP_API_KEY in env
-# - Fallback "web" provider: last resort; logs a generic "checked" event (fragile). Disable via TRACKER_DISABLE_FALLBACK=1
-#
-# Permissions & Destinations:
-# - Each tracking can have a preferred channel. If set, we post there iff the *user* has send perms in that channel;
-#   otherwise DM the user. If no channel set, DM the user.
-#
-# Notes:
-# - Carriers supported: fedex, ups, usps. "auto" tries to infer from the number pattern.
-# - Requires discord.py 2.3+
-
+# Now with strict-provider option and no-spam notifications.
 import os
 import re
 import json
@@ -40,7 +14,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ---------- Small JSON store ----------
-
 def _now_iso():
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
 
@@ -66,24 +39,19 @@ class JsonStore:
             os.replace(tmp, self.path)
 
 # ---------- Carrier utils ----------
-
 CARRIER_CODES = {"fedex", "ups", "usps"}
 
 def guess_carrier(number: str) -> Optional[str]:
     n = number.replace(" ", "").replace("-", "").upper()
-    # UPS: starts with 1Z + 16 chars
     if n.startswith("1Z") and len(n) >= 18:
         return "ups"
-    # FedEx: 12, 15, 20, 22, 34 digits commonly
     if re.fullmatch(r"\d{12}|\d{15}|\d{20}|\d{22}|\d{34}", n):
         return "fedex"
-    # USPS: 20–30 digits or AA#########US
     if re.fullmatch(r"[A-Z]{2}\d{9}US", n) or re.fullmatch(r"\d{20,30}", n):
         return "usps"
     return None
 
-# ---------- Provider Abstraction ----------
-
+# ---------- Providers ----------
 class TrackingEvent:
     def __init__(self, status: str, description: str, time: Optional[str], location: Optional[str] = None):
         self.status = status
@@ -101,21 +69,12 @@ class TrackingResult:
         self.last_update = last_update
         self.events = events
 
-    def to_dict(self):
-        return {
-            "status": self.status,
-            "delivered": self.delivered,
-            "last_update": self.last_update,
-            "events": [e.to_dict() for e in self.events],
-        }
-
 class ProviderBase:
     async def fetch(self, carrier: str, tracking_number: str) -> TrackingResult:
         raise NotImplementedError
 
 class AfterShipProvider(ProviderBase):
     BASE = "https://api.aftership.com/v4"
-
     def __init__(self, api_key: str):
         self.api_key = api_key
 
@@ -159,31 +118,19 @@ class AfterShipProvider(ProviderBase):
         return TrackingResult(status=status, delivered=delivered, last_update=last_time, events=events)
 
 class FallbackWebProvider(ProviderBase):
-    """Best-effort fetcher for public tracking pages; logs a generic 'checked' event."""
     FED_EX = "https://www.fedex.com/fedextrack/?trknbr={}"
     UPS = "https://www.ups.com/track?loc=en_US&tracknum={}"
     USPS = "https://tools.usps.com/go/TrackConfirmAction?tLabels={}"
-
     async def fetch(self, carrier: str, tracking_number: str) -> TrackingResult:
-        url = {
-            "fedex": self.FED_EX.format(tracking_number),
-            "ups": self.UPS.format(tracking_number),
-            "usps": self.USPS.format(tracking_number),
-        }.get(carrier)
-        if not url:
-            raise ValueError("Unsupported carrier for fallback")
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, timeout=30):
-                pass  # We don't parse; just log a check
+        # We intentionally do not parse; just a heartbeat event.
         ev = TrackingEvent(
             status="Checked",
-            description=f"Fetched public tracking page for {carrier.upper()} (parsing disabled).",
+            description=f"Fetched public {carrier.upper()} page (parsing disabled).",
             time=_now_iso(),
         )
         return TrackingResult(status="In Transit (unknown)", delivered=False, last_update=ev.time, events=[ev])
 
 # ---------- Main Cog ----------
-
 class ShippingTracker(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -191,13 +138,20 @@ class ShippingTracker(commands.Cog):
         self.store = JsonStore(db_path)
 
         self.aftership_key = os.getenv("AFTERSHIP_API_KEY")
+        # Strict by default if you have an API key
+        strict_default = "1" if self.aftership_key else "0"
+        self.strict_provider = os.getenv("TRACKER_STRICT_PROVIDER", strict_default) == "1"
         self.disable_fallback = os.getenv("TRACKER_DISABLE_FALLBACK") == "1"
 
         self.providers: List[ProviderBase] = []
         if self.aftership_key:
             self.providers.append(AfterShipProvider(self.aftership_key))
-        if not self.disable_fallback:
-            self.providers.append(FallbackWebProvider())
+            # Only add fallback if not strict and not explicitly disabled
+            if not self.strict_provider and not self.disable_fallback:
+                self.providers.append(FallbackWebProvider())
+        else:
+            if not self.disable_fallback:
+                self.providers.append(FallbackWebProvider())
 
         self.poll_interval = int(os.getenv("TRACKER_POLL_MINUTES", "15"))
         self._poller.start()
@@ -207,7 +161,6 @@ class ShippingTracker(commands.Cog):
             self._poller.cancel()
 
     # ---------- Provider usage ----------
-
     async def fetch_status(self, carrier: str, number: str) -> TrackingResult:
         if not self.providers:
             raise RuntimeError("No tracking providers configured. Set AFTERSHIP_API_KEY or enable fallback.")
@@ -217,11 +170,12 @@ class ShippingTracker(commands.Cog):
                 return await p.fetch(carrier, number)
             except Exception as e:
                 last_exc = e
+                if self.strict_provider:
+                    break  # do not fall back when strict
                 continue
         raise RuntimeError(f"All providers failed. Last error: {last_exc}")
 
     # ---------- Data helpers ----------
-
     async def _get_user_doc(self, user_id: int) -> Dict[str, Any]:
         data = await self.store.read()
         users = data.setdefault("users", {})
@@ -233,22 +187,13 @@ class ShippingTracker(commands.Cog):
         data["users"][str(user_id)] = user_doc
         await self.store.write(data)
 
-    # ---------- Autocomplete helpers ----------
-
-    async def tracking_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ):
-        """Suggest user's trackings by nickname/number/carrier (returns ID)."""
+    # ---------- Autocomplete ----------
+    async def tracking_autocomplete(self, interaction: discord.Interaction, current: str):
         user_doc = await self._get_user_doc(interaction.user.id)
         items = user_doc.get("trackings", {})
-
-        # Prefer active trackings first, then delivered
         def sort_key(item):
             tid, t = item
             return (1 if t.get("delivered_at") else 0, t.get("last_update") or "")
-
         choices = []
         for tid, t in sorted(items.items(), key=sort_key, reverse=True):
             label = f"{t.get('nickname') or t['number']} ({t['carrier'].upper()})"
@@ -259,7 +204,6 @@ class ShippingTracker(commands.Cog):
         return choices
 
     # ---------- Commands ----------
-
     track = app_commands.Group(name="track", description="Package tracking commands")
 
     @track.command(name="add", description="Add a tracking number")
@@ -269,14 +213,8 @@ class ShippingTracker(commands.Cog):
         nickname="Optional short name (e.g., 'GPU order')",
         channel="Optional channel for updates (otherwise you'll get DMs)"
     )
-    async def add(
-        self,
-        interaction: discord.Interaction,
-        carrier: str,
-        tracking_number: str,
-        nickname: Optional[str] = None,
-        channel: Optional[discord.TextChannel] = None,
-    ):
+    async def add(self, interaction: discord.Interaction, carrier: str, tracking_number: str,
+                  nickname: Optional[str] = None, channel: Optional[discord.TextChannel] = None):
         await interaction.response.defer(ephemeral=True, thinking=True)
         carrier = carrier.lower().strip()
         if carrier == "auto":
@@ -298,7 +236,7 @@ class ShippingTracker(commands.Cog):
             "created_at": _now_iso(),
             "delivered_at": None,
             "last_status": "Unknown",
-            "last_update": None,
+            "last_update": None,   # keep None until provider gives a real timestamp
             "history": [],
             "notify_channel_id": channel.id if channel else None,
             "last_notified_hash": None,
@@ -324,21 +262,13 @@ class ShippingTracker(commands.Cog):
         if not items:
             await interaction.response.send_message("You have no saved trackings.", ephemeral=True)
             return
-
-        active = []
-        delivered = []
+        active, delivered = [], []
         for tid, t in items.items():
             line = f"`{tid}` • **{t.get('nickname') or t['number']}** • {t['carrier'].upper()} • {t.get('last_status','?')}"
-            if t.get("delivered_at"):
-                delivered.append(line)
-            else:
-                active.append(line)
-
+            (delivered if t.get("delivered_at") else active).append(line)
         embed = discord.Embed(title="📦 Your Trackings", color=discord.Color.blurple())
-        if active:
-            embed.add_field(name="Active", value="\n".join(active[:1024]), inline=False)
-        if delivered:
-            embed.add_field(name="Delivered", value="\n".join(delivered[:1024]), inline=False)
+        if active:    embed.add_field(name="Active", value="\n".join(active[:1024]), inline=False)
+        if delivered: embed.add_field(name="Delivered", value="\n".join(delivered[:1024]), inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @track.command(name="remove", description="Remove a saved tracking by its ID")
@@ -437,10 +367,7 @@ class ShippingTracker(commands.Cog):
             avg_days = sum(delivered_days) / len(delivered_days) if delivered_days else None
             return count, avg_days, by_carrier
 
-        if scope == "global":
-            user_ids = list((data.get("users") or {}).keys())
-        else:
-            user_ids = [str(interaction.user.id)]
+        user_ids = list((data.get("users") or {}).keys()) if scope == "global" else [str(interaction.user.id)]
         total, avg_days, by_carrier = gather_events(user_ids)
 
         embed = discord.Embed(title=f"📈 Shipping Stats — {yr} ({scope.title()})", color=discord.Color.green())
@@ -451,7 +378,6 @@ class ShippingTracker(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ---------- Poller & Notifications ----------
-
     @tasks.loop(minutes=15.0)
     async def _poller(self):
         await self.bot.wait_until_ready()
@@ -463,14 +389,12 @@ class ShippingTracker(commands.Cog):
                 for g in self.bot.guilds:
                     m = g.get_member(int(uid))
                     if m:
-                        member = m
-                        break
+                        member = m; break
                 if not member:
                     member = await self.bot.fetch_user(int(uid))
             except Exception:
                 continue
 
-            changed = False
             for tid, t in list(udoc.get("trackings", {}).items()):
                 if t.get("delivered_at"):
                     continue
@@ -478,11 +402,7 @@ class ShippingTracker(commands.Cog):
                     res = await self.fetch_status(t["carrier"], t["number"])
                 except Exception:
                     continue
-                sent = await self._apply_update(member, tid, res, notify=True)
-                if sent:
-                    changed = True
-            if changed:
-                await self.store.write(data)
+                await self._apply_update(member, tid, res, notify=True)
 
     @_poller.before_loop
     async def _before(self):
@@ -492,69 +412,65 @@ class ShippingTracker(commands.Cog):
         except Exception:
             pass
 
-    async def _apply_update(
-        self,
-        user_or_member: discord.abc.User,
-        tracking_id: str,
-        res: TrackingResult,
-        seed_only: bool = False,
-        notify: bool = False,
-    ) -> bool:
-        """Merge a TrackingResult into storage. Return True if notification was sent."""
+    async def _apply_update(self, user_or_member: discord.abc.User, tracking_id: str,
+                            res: TrackingResult, seed_only: bool=False, notify: bool=False) -> bool:
         user_doc = await self._get_user_doc(user_or_member.id)
         t = user_doc["trackings"].get(tracking_id)
         if not t:
             return False
 
+        # Build a stable change-hash:
+        # - do NOT inject current time if provider didn't give last_update
+        stable_last_update = res.last_update or t.get("last_update") or ""
         last_event = res.events[-1] if res.events else None
-        new_hash = f"{res.status}|{res.delivered}|{res.last_update}|{(last_event.description if last_event else '')}"[:256]
+        last_desc = (last_event.description or "") if last_event else ""
+        new_hash = f"{res.status}|{res.delivered}|{stable_last_update}|{last_desc}"[:256]
         if t.get("last_notified_hash") == new_hash and not seed_only:
             return False
 
+        # Merge state
         t["last_status"] = res.status
-        t["last_update"] = res.last_update or _now_iso()
+        if res.last_update:
+            t["last_update"] = res.last_update  # keep previous if None
+        # Append events with light de-dupe on (status, desc, time)
+        seen = {(e.get("status"), e.get("description"), e.get("time")) for e in t.get("history", [])}
         for ev in res.events:
-            user_doc["events"] = user_doc.get("events", [])
-            t["history"].append(ev.to_dict())
+            key = (ev.status, ev.description, ev.time)
+            if key not in seen:
+                t["history"].append(ev.to_dict()); seen.add(key)
 
         if res.delivered and not t.get("delivered_at"):
-            t["delivered_at"] = t["last_update"]
+            t["delivered_at"] = t.get("last_update") or res.last_update or _now_iso()
 
         await self._save_user_doc(user_or_member.id, user_doc)
 
         if seed_only or not notify:
             return False
 
-        # Destination: preferred channel if the *user* can speak there; else DM
-        chan_id = t.get("notify_channel_id")
+        # Destination: preferred channel if the user can speak there; else DM
         dest = None
+        chan_id = t.get("notify_channel_id")
         if chan_id:
             for g in self.bot.guilds:
                 ch = g.get_channel(chan_id)
                 if ch and isinstance(ch, discord.TextChannel):
                     member = ch.guild.get_member(user_or_member.id)
                     if member and ch.permissions_for(member).send_messages:
-                        dest = ch
-                        break
+                        dest = ch; break
 
         embed = discord.Embed(
             title=f"📦 {t.get('nickname') or t['number']} — {t['carrier'].upper()}",
             description=res.status,
-            color=discord.Color.blurple() if not res.delivered else discord.Color.green(),
+            color=discord.Color.green() if res.delivered else discord.Color.blurple(),
             timestamp=dt.datetime.utcnow()
         )
         if last_event:
-            le = last_event
-            more = []
-            if le.location:
-                more.append(le.location)
-            if le.time:
-                more.append(le.time)
-            embed.add_field(
-                name=le.status or "Update",
-                value=f"{le.description or ''}\n" + (" — ".join(more) if more else ""),
-                inline=False,
-            )
+            bits = []
+            if last_event.location: bits.append(last_event.location)
+            if last_event.time:     bits.append(last_event.time)
+            embed.add_field(name=last_event.status or "Update",
+                            value=f"{last_event.description or ''}\n" + (" — ".join(bits) if bits else ""),
+                            inline=False)
         if res.delivered:
             embed.set_footer(text="Delivered")
 
@@ -570,6 +486,5 @@ class ShippingTracker(commands.Cog):
             return False
 
 # ---------- Setup ----------
-
 async def setup(bot: commands.Bot):
     await bot.add_cog(ShippingTracker(bot))
