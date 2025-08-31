@@ -4,12 +4,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # External deps (install: pip install mcstatus mcrcon)
 from mcstatus import JavaServer, BedrockServer
@@ -33,6 +34,11 @@ class ServerConfig:
     # legacy (ignored in RCON-only mode; kept for compatibility so old JSON loads)
     properties_path: Optional[str] = None
 
+    # Sticky embed config
+    sticky_channel_id: Optional[int] = None
+    sticky_message_id: Optional[int] = None
+    sticky_interval_min: Optional[int] = None  # minutes (>=1)
+
 
 def load_all_configs() -> Dict[str, ServerConfig]:
     if not os.path.exists(CONFIG_PATH):
@@ -42,7 +48,10 @@ def load_all_configs() -> Dict[str, ServerConfig]:
     out: Dict[str, ServerConfig] = {}
     for gid, obj in raw.items():
         # drop unknown keys to be future-proof
-        allowed = {"kind","host","port","rcon_host","rcon_port","rcon_password","properties_path"}
+        allowed = {
+            "kind","host","port","rcon_host","rcon_port","rcon_password","properties_path",
+            "sticky_channel_id","sticky_message_id","sticky_interval_min",
+        }
         slim = {k: v for k, v in obj.items() if k in allowed}
         out[gid] = ServerConfig(**slim)
     return out
@@ -137,6 +146,22 @@ async def rcon_stop_sequence(host: str, port: int, password: str, *, warn_secs: 
     if not ok:
         return False, f"stop failed: {resp}"
     return True, "stop issued"
+
+
+async def rcon_player_names_if_available(cfg: ServerConfig) -> List[str]:
+    """Best-effort parse of Java 'list' output into player names."""
+    if cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
+        return []
+    rp = effective_port(cfg.kind, cfg.rcon_port)
+    ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, "list")
+    if not ok or not resp:
+        return []
+    # Common format: "There are X of a max of Y players online: name1, name2, name3"
+    # We'll split on colon if present and then commas.
+    part = resp.split(":", 1)
+    names_blob = part[1] if len(part) > 1 else ""
+    names = [n.strip() for n in names_blob.split(",") if n.strip()]
+    return names
 
 
 # =========================
@@ -499,6 +524,15 @@ class MinecraftCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.configs: Dict[str, ServerConfig] = load_all_configs()
+        # sticky scheduling memory: next-due epoch per guild id (str)
+        self._sticky_next: Dict[str, float] = {}
+        self._sticky_updater.start()
+
+    def cog_unload(self):
+        try:
+            self._sticky_updater.cancel()
+        except Exception:
+            pass
 
     # ---------- helpers ----------
     async def build_status_embed(self, guild_id: Optional[int]) -> discord.Embed:
@@ -533,7 +567,10 @@ class MinecraftCog(commands.Cog):
             embed.add_field(name="Ping", value=ping, inline=True)
             embed.add_field(name="Players", value=players, inline=True)
 
+            # Player names: prefer mcstatus sample; if empty and RCON available (Java), try parsing 'list'
             sample = data.get("sample") or []
+            if not sample:
+                sample = await rcon_player_names_if_available(cfg)
             if sample:
                 shown = ", ".join(sample[:20])
                 more = f" … (+{len(sample)-20} more)" if len(sample) > 20 else ""
@@ -547,8 +584,84 @@ class MinecraftCog(commands.Cog):
 
         hints: List[str] = []
         hints.append("RCON ready" if (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password) else "RCON not set")
+        if cfg.sticky_channel_id and cfg.sticky_interval_min:
+            hints.append(f"Sticky: #{cfg.sticky_channel_id} / {cfg.sticky_interval_min}m")
         embed.set_footer(text=" • ".join(hints))
         return embed
+
+    async def _refresh_sticky_for_guild(self, gid: str) -> None:
+        """Create or edit the sticky status message for a guild."""
+        cfg = self.configs.get(gid)
+        if not cfg or not cfg.sticky_channel_id or not cfg.sticky_interval_min:
+            return
+
+        guild = self.bot.get_guild(int(gid))
+        if not guild:
+            return
+
+        channel = guild.get_channel(cfg.sticky_channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            # channel missing or wrong type → disable sticky to avoid loop spam
+            cfg.sticky_channel_id = None
+            cfg.sticky_message_id = None
+            save_all_configs(self.configs)
+            return
+
+        # Build embed
+        embed = await self.build_status_embed(guild.id)
+
+        # Try to edit existing message; if not found/forbidden, send a new one
+        msg = None
+        if cfg.sticky_message_id:
+            try:
+                msg = await channel.fetch_message(cfg.sticky_message_id)
+            except discord.NotFound:
+                msg = None
+            except discord.Forbidden:
+                msg = None
+            except discord.HTTPException:
+                msg = None
+
+        if msg:
+            try:
+                await msg.edit(content="‎", embed=embed)  # zero-width char to keep content non-empty
+            except discord.HTTPException:
+                # fall back to new message
+                msg = None
+
+        if not msg:
+            try:
+                sent = await channel.send(embed=embed)
+                cfg.sticky_message_id = sent.id
+                save_all_configs(self.configs)
+            except discord.HTTPException:
+                # If we can't send, silently skip until next interval
+                return
+
+    # ---------- background updater ----------
+    @tasks.loop(seconds=30)
+    async def _sticky_updater(self):
+        now = time.time()
+        for gid, cfg in list(self.configs.items()):
+            if not (cfg.sticky_channel_id and cfg.sticky_interval_min and cfg.sticky_interval_min >= 1):
+                continue
+            due = self._sticky_next.get(gid, 0)
+            if now >= due:
+                # jitter protection: schedule next first, then run
+                self._sticky_next[gid] = now + (cfg.sticky_interval_min * 60)
+                try:
+                    await self._refresh_sticky_for_guild(gid)
+                except Exception:
+                    # avoid crashing the loop; next tick will try again
+                    pass
+
+    @_sticky_updater.before_loop
+    async def _before_sticky(self):
+        await self.bot.wait_until_ready()
+        # prime the next times so they start soon after boot
+        for gid, cfg in self.configs.items():
+            if cfg.sticky_channel_id and cfg.sticky_interval_min:
+                self._sticky_next[gid] = time.time() + 10  # update ~10s after ready
 
     # ---------- slash commands ----------
     group = app_commands.Group(name="mc", description="Minecraft server controls")
@@ -644,6 +757,57 @@ class MinecraftCog(commands.Cog):
             return await interaction.followup.send("Not configured. Use `/mc setup`.", ephemeral=True)
         ok, data = await mc_status(cfg.kind, cfg.host, cfg.port)
         await interaction.followup.send(("✅ Reachable." if ok else f"❌ Unreachable: `{data.get('error','unknown error')}`"), ephemeral=True)
+
+    # ---------- NEW: Sticky status commands ----------
+    @group.command(name="sticky_set", description="Enable/Update the sticky status in a channel (auto-updating embed).")
+    @app_commands.describe(
+        channel="Channel to pin the live status message in",
+        interval_minutes="Update interval in minutes (min 1)"
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def sticky_set(self, interaction: discord.Interaction, channel: discord.TextChannel, interval_minutes: app_commands.Range[int, 1, 1440]):
+        gid = str(interaction.guild_id)
+        cfg = self.configs.get(gid)
+        if not cfg:
+            return await interaction.response.send_message("⚠️ Not configured yet. Run `/mc setup` first.", ephemeral=True)
+
+        cfg.sticky_channel_id = channel.id
+        cfg.sticky_interval_min = int(interval_minutes)
+        # message id will be set/updated on first run
+        save_all_configs(self.configs)
+
+        # schedule immediate refresh
+        self._sticky_next[gid] = time.time() + 1
+        await interaction.response.send_message(f"✅ Sticky status set to {channel.mention} every **{interval_minutes}m**.", ephemeral=True)
+
+    @group.command(name="sticky_disable", description="Disable the sticky status message.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def sticky_disable(self, interaction: discord.Interaction):
+        gid = str(interaction.guild_id)
+        cfg = self.configs.get(gid)
+        if not cfg or not cfg.sticky_channel_id:
+            return await interaction.response.send_message("Sticky status is not enabled.", ephemeral=True)
+
+        cfg.sticky_channel_id = None
+        cfg.sticky_message_id = None
+        cfg.sticky_interval_min = None
+        save_all_configs(self.configs)
+        self._sticky_next.pop(gid, None)
+        await interaction.response.send_message("✅ Sticky status disabled.", ephemeral=True)
+
+    @group.command(name="sticky_now", description="Force an immediate sticky status refresh.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def sticky_now(self, interaction: discord.Interaction):
+        gid = str(interaction.guild_id)
+        cfg = self.configs.get(gid)
+        if not cfg or not cfg.sticky_channel_id:
+            return await interaction.response.send_message("Sticky status is not enabled. Use `/mc sticky_set`.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self._refresh_sticky_for_guild(gid)
+            await interaction.followup.send("✅ Sticky status updated.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Update failed: `{e}`", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
