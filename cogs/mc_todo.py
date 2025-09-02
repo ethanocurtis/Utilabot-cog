@@ -43,7 +43,7 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
         return None
 
 # =====================================================================
-# UI: Modals & Panel View (persistent; with dropdown)
+# UI: Modals & Selects
 # =====================================================================
 
 class AddTaskModal(discord.ui.Modal):
@@ -137,16 +137,13 @@ class TaskSelect(discord.ui.Select):
     CID_SELECT = "mctodo:select"
 
     def __init__(self, cog: "MCTodo", guild_id: Optional[int], *, placeholder: str = "Select a task to mark done"):
-        # Build options from the guild's current To-Do list (latest 25)
         options: List[discord.SelectOption] = []
         if guild_id is not None:
             g = cog._g(guild_id)
             todos = list(g.get("todo", []))[-25:]  # latest 25
-            # reverse to show newest first
-            todos.reverse()
+            todos.reverse()  # newest first
             for t in todos:
                 label = f"#{int(t['id']):03} [{t.get('priority','low')}]"
-                # trim desc to avoid huge menus
                 desc_text = t.get("text", "")
                 if len(desc_text) > 90:
                     desc_text = desc_text[:87] + "..."
@@ -157,7 +154,6 @@ class TaskSelect(discord.ui.Select):
                         value=str(t["id"]),
                     )
                 )
-        # If no options available, provide a no-op one
         if not options:
             options = [discord.SelectOption(label="No To-Do tasks available", value="noop", default=True)]
 
@@ -186,7 +182,6 @@ class TaskSelect(discord.ui.Select):
         t = self.cog._find_task(g, tid, in_done=False)
         if not t:
             await interaction.response.send_message("❌ Task not found in To-Do (maybe already completed).", ephemeral=True)
-            # try refreshing since list may be stale
             await self.cog._refresh_outputs(interaction.guild)
             return
 
@@ -200,24 +195,27 @@ class TaskSelect(discord.ui.Select):
         await self.cog._refresh_outputs(interaction.guild)
 
 
-class PanelView(discord.ui.View):
-    """Persistent buttons + dropdown under the panel message.
+class DoneSelectView(discord.ui.View):
+    """Ephemeral view that only contains the selector; shown after clicking 'Mark Done'."""
+    def __init__(self, cog: "MCTodo", guild_id: int):
+        super().__init__(timeout=120)
+        self.add_item(TaskSelect(cog, guild_id))
 
-    We register a persistent instance at startup (with generic/no-op options)
-    so interactions still work after restarts. When sending/updating the panel,
-    we build a fresh view with guild-specific options via _panel_view(guild).
-    """
+# =====================================================================
+# Panel View (persistent buttons only)
+# =====================================================================
+
+class PanelView(discord.ui.View):
+    """Persistent buttons under the panel message (no always-visible dropdown)."""
     CID_ADD = "mctodo:add"
     CID_DONE = "mctodo:done"
     CID_VIEW = "mctodo:view"
-    # Select uses TaskSelect.CID_SELECT
 
     def __init__(self, cog: "MCTodo", guild_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild_id = guild_id
 
-        # Buttons
         btn_add = discord.ui.Button(label="Add Task", emoji="➕", style=discord.ButtonStyle.success, custom_id=self.CID_ADD)
         btn_done = discord.ui.Button(label="Mark Done", emoji="✅", style=discord.ButtonStyle.primary, custom_id=self.CID_DONE)
         btn_view = discord.ui.Button(label="View All", emoji="📋", style=discord.ButtonStyle.secondary, custom_id=self.CID_VIEW)
@@ -230,14 +228,21 @@ class PanelView(discord.ui.View):
         self.add_item(btn_done)
         self.add_item(btn_view)
 
-        # Dropdown (guild-aware if provided)
-        self.add_item(TaskSelect(self.cog, guild_id))
-
     async def on_add_click(self, interaction: discord.Interaction):
         await interaction.response.send_modal(AddTaskModal(self.cog))
 
     async def on_done_click(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(DoneTaskModal(self.cog))
+        # Send an ephemeral list + dropdown to choose a task to complete
+        g = self.cog._g(interaction.guild_id)
+        items = g.get("todo", [])
+        embed = self.cog._make_list_embed(
+            "To-Do (select one to complete)",
+            items,
+            note="Pick from the dropdown below • You can also use /mctodo list for filters.",
+            limit=15,
+        )
+        view = DoneSelectView(self.cog, interaction.guild_id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def on_view_click(self, interaction: discord.Interaction):
         g = self.cog._g(interaction.guild_id)
@@ -251,7 +256,7 @@ class PanelView(discord.ui.View):
 # =====================================================================
 
 class MCTodo(commands.Cog):
-    """Minecraft Server To-Do list with sticky panel, optional channel topic updates, daily digest, panel buttons, and dropdown."""
+    """Minecraft Server To-Do list with sticky panel, optional channel topic updates, daily digest, panel buttons, and ephemeral dropdown."""
 
     # =========================
     # Init / file I/O
@@ -262,8 +267,7 @@ class MCTodo(commands.Cog):
         self.data: Dict[str, Any] = {"guilds": {}}
         self._load_sync()
 
-        # Register a persistent view so components survive restarts.
-        # (Uses a generic/no-op dropdown; live panels use a guild-aware view.)
+        # Register a persistent view so button interactions survive restarts.
         self.bot.add_view(PanelView(self, guild_id=None))
 
         self._ticker.start()
@@ -423,7 +427,6 @@ class MCTodo(commands.Cog):
     # Output refreshers
     # =========================
     def _panel_view(self, guild: discord.Guild) -> PanelView:
-        # View with guild-specific dropdown options
         return PanelView(self, guild_id=guild.id)
 
     async def _refresh_panel(self, guild: discord.Guild):
@@ -440,7 +443,6 @@ class MCTodo(commands.Cog):
         try:
             msg = await channel.fetch_message(int(msg_id))
         except Exception:
-            # stale message; unbind
             s["panel_message_id"] = None
             await self._save()
             return
@@ -471,7 +473,7 @@ class MCTodo(commands.Cog):
             topic += f" | {top_tags}"
 
         try:
-            await channel.edit(topic=topic[:1024])  # topic limit
+            await channel.edit(topic=topic[:1024])
         except (discord.Forbidden, discord.HTTPException):
             pass
 
@@ -513,7 +515,6 @@ class MCTodo(commands.Cog):
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 continue
 
-            # Compose digest
             todo = g.get("todo", [])
             pr_counter = Counter(t.get("priority", "low") for t in todo)
             embed = discord.Embed(
@@ -536,7 +537,6 @@ class MCTodo(commands.Cog):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-            # nice moment to refresh visible surfaces
             await self._refresh_outputs(guild)
 
     @_ticker.before_loop
@@ -769,7 +769,7 @@ class MCTodo(commands.Cog):
         s["panel_channel_id"] = msg.channel.id
         s["panel_message_id"] = msg.id
         await self._save()
-        await interaction.followup.send("📌 Panel set. Buttons & dropdown added. I’ll keep this message updated.", ephemeral=True)
+        await interaction.followup.send("📌 Panel set. Buttons added. I’ll keep this message updated.", ephemeral=True)
 
     @mctodo.command(name="panel_clear", description="Unbind (and delete) the current To-Do summary panel.")
     @app_commands.checks.has_permissions(manage_guild=True)
