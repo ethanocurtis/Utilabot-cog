@@ -31,6 +31,7 @@ COGS = [
     "cogs.text_adventure",
     "cogs.tickets",
     "cogs.minecraft",
+    "cogs.mc_todo",
 ]
 
 class UtilaBot(commands.Bot):
