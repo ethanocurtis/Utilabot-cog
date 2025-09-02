@@ -535,13 +535,13 @@ class MinecraftCog(commands.Cog):
             pass
 
     # ---------- helpers ----------
-    async def build_status_embed(self, guild_id: Optional[int]) -> discord.Embed:
+    async def build_status_embed(self, guild_id: Optional[int], *, simple: bool = False) -> discord.Embed:
         gid = str(guild_id) if guild_id else "global"
         cfg = self.configs.get(gid)
 
         embed = discord.Embed(
-            title="🟩 Minecraft Server Panel" if cfg else "Minecraft Server Panel",
-            description="Live status • RCON controls",
+            title="Minecraft Server Panel",
+            description=("Live status" if simple else "Live status • RCON controls"),
             color=discord.Color.blurple(),
         )
         embed.set_thumbnail(url="https://static.wikia.nocookie.net/minecraft_gamepedia/images/5/51/Grass_Block_JE2_BE2.png")
@@ -556,18 +556,21 @@ class MinecraftCog(commands.Cog):
             status_line = f"**Online** `{cfg.host}:{show_port}`"
             embed.add_field(name="Status", value=status_line, inline=False)
 
-            motd = data.get("motd") or "—"
+            # Hide MOTD when simple=True, show it otherwise.
+            if not simple:
+                motd = data.get("motd") or "—"
+                embed.add_field(name="MOTD", value=f"```{motd}```", inline=False)
+
             version = data.get("version") or "—"
             latency = data.get("latency")
             ping = f"{round(latency)} ms" if latency is not None else "—"
             players = f"{data.get('players_online', 0)}/{data.get('players_max','?')}"
 
-            embed.add_field(name="MOTD", value=f"```{motd}```", inline=False)
             embed.add_field(name="Version", value=version, inline=True)
             embed.add_field(name="Ping", value=ping, inline=True)
             embed.add_field(name="Players", value=players, inline=True)
 
-            # Player names: prefer mcstatus sample; if empty and RCON available (Java), try parsing 'list'
+            # Always show player list (even in simple mode)
             sample = data.get("sample") or []
             if not sample:
                 sample = await rcon_player_names_if_available(cfg)
@@ -607,26 +610,21 @@ class MinecraftCog(commands.Cog):
             save_all_configs(self.configs)
             return
 
-        # Build embed
-        embed = await self.build_status_embed(guild.id)
+        # Build embed (simple=True hides MOTD but keeps player list)
+        embed = await self.build_status_embed(guild.id, simple=True)
 
         # Try to edit existing message; if not found/forbidden, send a new one
         msg = None
         if cfg.sticky_message_id:
             try:
                 msg = await channel.fetch_message(cfg.sticky_message_id)
-            except discord.NotFound:
-                msg = None
-            except discord.Forbidden:
-                msg = None
-            except discord.HTTPException:
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 msg = None
 
         if msg:
             try:
                 await msg.edit(content="‎", embed=embed)  # zero-width char to keep content non-empty
             except discord.HTTPException:
-                # fall back to new message
                 msg = None
 
         if not msg:
@@ -635,7 +633,6 @@ class MinecraftCog(commands.Cog):
                 cfg.sticky_message_id = sent.id
                 save_all_configs(self.configs)
             except discord.HTTPException:
-                # If we can't send, silently skip until next interval
                 return
 
     # ---------- background updater ----------
