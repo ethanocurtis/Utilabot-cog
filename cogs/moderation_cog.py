@@ -23,8 +23,8 @@ def _has_guild_admin_perms(inter: discord.Interaction) -> bool:
 class Moderation(commands.Cog):
     """
     Moderation utilities:
-      - /purge (bulk recent)
-      - /purge_all (delete entire channel history, skips pinned)
+      - /purge (bulk recent, <=14 days)
+      - /purge_all (wipe entire channel, skips pinned; bulk for recent + paced slow delete for older)
       - /autodelete set|disable|status|list
       - runtime deletion (per-message if <60s, periodic sweep for >=60s)
 
@@ -190,27 +190,59 @@ class Moderation(commands.Cog):
 
         await inter.response.defer(ephemeral=True, thinking=True)
 
-        deleted = 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+
+        def check(m: discord.Message):
+            if getattr(m, "pinned", False):
+                return False
+            if user is not None and m.author.id != user.id:
+                return False
+            return True
+
+        total_deleted = 0
+
+        # 1) FAST PATH: bulk purge everything newer than 14 days
         try:
-            # Iterate entire history and delete one-by-one to bypass 14-day bulk limit.
-            async for m in inter.channel.history(limit=None, oldest_first=False):
-                if getattr(m, "pinned", False):
-                    continue
-                if user and m.author.id != user.id:
+            while True:
+                batch = await inter.channel.purge(
+                    limit=1000,
+                    check=check,
+                    after=cutoff,
+                    bulk=True
+                )
+                total_deleted += len(batch)
+                # If we deleted less than the max, we've likely exhausted the after=cutoff range
+                if len(batch) < 1000:
+                    break
+                # short pause between bulk rounds
+                await asyncio.sleep(0.5)
+        except Exception:
+            # If bulk purge fails for some reason, we fall through to slow path for the rest
+            pass
+
+        # 2) SLOW PATH: delete everything older than 14 days, one-by-one with pacing
+        try:
+            deleted_slow = 0
+            async for m in inter.channel.history(limit=None, oldest_first=False, before=cutoff):
+                if not check(m):
                     continue
                 try:
                     await m.delete()
-                    deleted += 1
+                    deleted_slow += 1
+                    total_deleted += 1
                 except Exception:
-                    # soft-fail on individual messages (rate-limits/errors)
+                    # swallow individual failures
                     pass
-                # Gentle pacing to play nice with rate limits
-                if deleted % 25 == 0:
-                    await asyncio.sleep(1)
-        except Exception as e:
-            return await inter.followup.send(f"Stopped early due to an error: {e}\nDeleted so far: **{deleted}**.", ephemeral=True)
 
-        await inter.followup.send(f"🧨 Purge complete. Deleted **{deleted}** messages.", ephemeral=True)
+                # Pacing to keep 429s manageable
+                if deleted_slow % 5 == 0:
+                    await asyncio.sleep(1.2)
+        except Exception as e:
+            return await inter.followup.send(
+                f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**.", ephemeral=True
+            )
+
+        await inter.followup.send(f"🧨 Purge complete. Deleted **{total_deleted}** messages.", ephemeral=True)
 
     # ---------- /autodelete set|disable|status|list ----------
     @app_commands.command(name="autodelete", description="Manage auto-delete for this channel (set/disable/status/list).")
@@ -435,7 +467,6 @@ class Moderation(commands.Cog):
 
     @staticmethod
     def _pretty_seconds(seconds: int) -> str:
-        # Format up to days with components
         parts = []
         d, rem = divmod(seconds, 86400)
         h, rem = divmod(rem, 3600)
@@ -446,8 +477,8 @@ class Moderation(commands.Cog):
             parts.append(f"{h} hour{'s' if h != 1 else ''}")
         if m:
             parts.append(f"{m} minute{'s' if m != 1 else ''}")
-        if s and seconds < 60 or (s and not (d or h or m)):
-            # show seconds when <60, or when it's the only unit
+        # show seconds when <60, or when seconds exist but no larger units
+        if s and (seconds < 60 or not (d or h or m)):
             parts.append(f"{s} second{'s' if s != 1 else ''}")
         return " ".join(parts) if parts else "0 seconds"
 
