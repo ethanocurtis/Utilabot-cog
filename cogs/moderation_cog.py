@@ -153,7 +153,7 @@ class Moderation(commands.Cog):
     @app_commands.command(name="autodelete", description="Manage auto-delete for this channel (set/disable/status/list).")
     @app_commands.describe(
         action="Choose what to do",
-        value="For 'set': duration like 10s, 2m, or just 2 (minutes). Ignored for other actions."
+        value="For 'set': duration like 10s, 2m, 1h, or just 2 (minutes). Ignored for other actions."
     )
     @gated()
     @app_commands.choices(
@@ -204,7 +204,6 @@ class Moderation(commands.Cog):
                     continue
                 if not inter.guild or not ch.guild or ch.guild.id != inter.guild.id:
                     continue
-                # Prefer a stable human name for sorting
                 name = getattr(ch, "name", str(cid))
                 rows.append((name.lower(), ch.mention, int(secs)))
 
@@ -240,12 +239,12 @@ class Moderation(commands.Cog):
         if act == "set":
             if not value:
                 return await inter.response.send_message(
-                    "Provide a duration like **10s**, **2m**, or just **2** (minutes).", ephemeral=True
+                    "Provide a duration like **10s**, **2m**, **1h**, or just **2** (minutes).", ephemeral=True
                 )
             seconds = self._parse_duration_to_seconds(value.strip().lower())
             if seconds is None:
                 return await inter.response.send_message(
-                    "Invalid format. Use **10s**, **2m**, or a number for minutes.", ephemeral=True
+                    "Invalid format. Use **10s**, **2m**, **1h**, or a number for minutes.", ephemeral=True
                 )
             if seconds < 5 or seconds > 86_400:
                 return await inter.response.send_message(
@@ -339,8 +338,11 @@ class Moderation(commands.Cog):
     # ---------- helpers ----------
     @staticmethod
     def _parse_duration_to_seconds(s: str) -> Optional[int]:
-        # Accept "10s", "2m", "2", with small whitespace tolerance
-        m = re.fullmatch(r"\s*(\d+)\s*([sm]?)\s*", s)
+        """
+        Accepts "10s", "2m", "1h", or just "2" (minutes).
+        Whitespace tolerated, single unit only (no 1h30m combos).
+        """
+        m = re.fullmatch(r"\s*(\d+)\s*([hms]?)\s*", s)
         if not m:
             return None
         val = int(m.group(1))
@@ -349,6 +351,8 @@ class Moderation(commands.Cog):
             return val
         if unit == "m":
             return val * 60
+        if unit == "h":
+            return val * 3600
         return None
 
     @staticmethod
@@ -357,6 +361,12 @@ class Moderation(commands.Cog):
             return f"{seconds} seconds"
         if seconds % 3600 == 0:
             return f"{seconds // 3600} hours"
+        if seconds >= 3600:
+            h = seconds // 3600
+            rem = seconds % 3600
+            if rem % 60 == 0:
+                return f"{h} hours {rem // 60} minutes"
+            return f"{h} hours {rem // 60} minutes {rem % 60} seconds"
         if seconds % 60 == 0:
             return f"{seconds // 60} minutes"
         return f"{seconds // 60} minutes {seconds % 60} seconds"
