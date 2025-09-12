@@ -22,17 +22,19 @@ def _has_guild_admin_perms(inter: discord.Interaction) -> bool:
 
 class Moderation(commands.Cog):
     """
-    Moderation utilities: /purge and auto-delete controls, plus the actual
-    deletion runtime (per-message for <60s and periodic sweep for >=60s).
+    Moderation utilities:
+      - /purge (bulk recent)
+      - /purge_all (delete entire channel history, skips pinned)
+      - /autodelete set|disable|status|list
+      - runtime deletion (per-message if <60s, periodic sweep for >=60s)
 
-    This cog tries to use your global `bot.store` if present. It supports either:
-      - Store with get/set/remove_autodelete()
-      - WxStore-style config with set_config/get_config/delete_config (and optional get_config_all())
+    Store abstraction supports:
+      - Store with set_autodelete/remove_autodelete/get_autodelete()
+      - WxStore with set_config/delete_config/get_config/get_config_all()
     """
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.store = getattr(bot, "store", None)
-        # start periodic sweeper once bot is ready
         if not getattr(self, "_sweeper_started", False):
             self.cleanup_loop.start()
             self._sweeper_started = True
@@ -116,8 +118,8 @@ class Moderation(commands.Cog):
                 return 0
         return 0
 
-    # ---------- /purge ----------
-    @app_commands.command(name="purge", description="Bulk delete recent messages (max 1000).")
+    # ---------- /purge (bulk recent) ----------
+    @app_commands.command(name="purge", description="Bulk delete recent messages (max 1000, ≤14 days).")
     @app_commands.describe(limit="Number of recent messages to scan (1-1000)", user="Only delete messages by this user")
     @gated()
     async def purge(
@@ -149,11 +151,72 @@ class Moderation(commands.Cog):
         except discord.HTTPException as e:
             await inter.followup.send(f"Error while deleting: {e}", ephemeral=True)
 
+    # ---------- /purge_all (all history, any age) ----------
+    @app_commands.command(
+        name="purge_all",
+        description="Delete ALL messages in this channel, regardless of age (skips pinned)."
+    )
+    @app_commands.describe(
+        confirm="Must be true to proceed (safety check).",
+        user="Optional: only delete messages by this user"
+    )
+    @gated()
+    async def purge_all(
+        self,
+        inter: discord.Interaction,
+        confirm: bool,
+        user: Optional[discord.User] = None,
+    ):
+        if not await self._require_text_channel(inter):
+            return
+        if not self._is_admin_or_allowlisted(inter):
+            return await inter.response.send_message(
+                "You need **Administrator/Manage Server** or be on the bot's admin allowlist.", ephemeral=True
+            )
+        if not confirm:
+            return await inter.response.send_message(
+                "⚠️ Confirmation required. Re-run with `confirm: true`.", ephemeral=True
+            )
+
+        # Permission sanity
+        try:
+            perms = inter.channel.permissions_for(inter.guild.me) if inter.guild else None
+            if not perms or not perms.manage_messages or not perms.read_message_history:
+                return await inter.response.send_message(
+                    "I need **Manage Messages** and **Read Message History**.", ephemeral=True
+                )
+        except Exception:
+            pass
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        deleted = 0
+        try:
+            # Iterate entire history and delete one-by-one to bypass 14-day bulk limit.
+            async for m in inter.channel.history(limit=None, oldest_first=False):
+                if getattr(m, "pinned", False):
+                    continue
+                if user and m.author.id != user.id:
+                    continue
+                try:
+                    await m.delete()
+                    deleted += 1
+                except Exception:
+                    # soft-fail on individual messages (rate-limits/errors)
+                    pass
+                # Gentle pacing to play nice with rate limits
+                if deleted % 25 == 0:
+                    await asyncio.sleep(1)
+        except Exception as e:
+            return await inter.followup.send(f"Stopped early due to an error: {e}\nDeleted so far: **{deleted}**.", ephemeral=True)
+
+        await inter.followup.send(f"🧨 Purge complete. Deleted **{deleted}** messages.", ephemeral=True)
+
     # ---------- /autodelete set|disable|status|list ----------
     @app_commands.command(name="autodelete", description="Manage auto-delete for this channel (set/disable/status/list).")
     @app_commands.describe(
         action="Choose what to do",
-        value="For 'set': duration like 10s, 2m, 1h, or just 2 (minutes). Ignored for other actions."
+        value="For 'set': duration like '45s', '10m', '1h', '2d', or mixed '1d 2h 30m'. Or just '5' (minutes)."
     )
     @gated()
     @app_commands.choices(
@@ -239,16 +302,19 @@ class Moderation(commands.Cog):
         if act == "set":
             if not value:
                 return await inter.response.send_message(
-                    "Provide a duration like **10s**, **2m**, **1h**, or just **2** (minutes).", ephemeral=True
+                    "Provide a duration like **45s**, **10m**, **1h**, **2d**, or mixed **1d 2h 30m**. "
+                    "A plain number (e.g. **5**) is minutes.",
+                    ephemeral=True
                 )
-            seconds = self._parse_duration_to_seconds(value.strip().lower())
+            seconds = self._parse_duration_to_seconds(value)
             if seconds is None:
                 return await inter.response.send_message(
-                    "Invalid format. Use **10s**, **2m**, **1h**, or a number for minutes.", ephemeral=True
+                    "Invalid format. Examples: **45s**, **10m**, **1h**, **2d**, **1d 2h 30m**, or **5** (minutes).",
+                    ephemeral=True
                 )
-            if seconds < 5 or seconds > 86_400:
+            if seconds < 5 or seconds > 2_592_000:  # 30 days max
                 return await inter.response.send_message(
-                    "Range must be **5 seconds** to **24 hours**.", ephemeral=True
+                    "Range must be **5 seconds** to **30 days**.", ephemeral=True
                 )
             try:
                 self._ad_set(inter.channel.id, int(seconds))
@@ -339,37 +405,51 @@ class Moderation(commands.Cog):
     @staticmethod
     def _parse_duration_to_seconds(s: str) -> Optional[int]:
         """
-        Accepts "10s", "2m", "1h", or just "2" (minutes).
-        Whitespace tolerated, single unit only (no 1h30m combos).
+        Accepts:
+          - Mixed units: "1d 2h 30m 10s", "2h", "90m", "45s", etc.
+          - Plain number: "5" (minutes).
+        Units: d=days, h=hours, m=minutes, s=seconds. Case-insensitive.
         """
-        m = re.fullmatch(r"\s*(\d+)\s*([hms]?)\s*", s)
-        if not m:
+        if not isinstance(s, str):
             return None
-        val = int(m.group(1))
-        unit = m.group(2) or "m"  # default minutes
-        if unit == "s":
-            return val
-        if unit == "m":
-            return val * 60
-        if unit == "h":
-            return val * 3600
-        return None
+        s = s.strip().lower()
+
+        # Plain number means minutes
+        if re.fullmatch(r"\d+", s):
+            return int(s) * 60
+
+        total = 0
+        matched_any = False
+        for num, unit in re.findall(r"(\d+)\s*([dhms])", s):
+            matched_any = True
+            val = int(num)
+            if unit == "d":
+                total += val * 86400
+            elif unit == "h":
+                total += val * 3600
+            elif unit == "m":
+                total += val * 60
+            elif unit == "s":
+                total += val
+        return total if matched_any and total > 0 else None
 
     @staticmethod
     def _pretty_seconds(seconds: int) -> str:
-        if seconds < 60:
-            return f"{seconds} seconds"
-        if seconds % 3600 == 0:
-            return f"{seconds // 3600} hours"
-        if seconds >= 3600:
-            h = seconds // 3600
-            rem = seconds % 3600
-            if rem % 60 == 0:
-                return f"{h} hours {rem // 60} minutes"
-            return f"{h} hours {rem // 60} minutes {rem % 60} seconds"
-        if seconds % 60 == 0:
-            return f"{seconds // 60} minutes"
-        return f"{seconds // 60} minutes {seconds % 60} seconds"
+        # Format up to days with components
+        parts = []
+        d, rem = divmod(seconds, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        if d:
+            parts.append(f"{d} day{'s' if d != 1 else ''}")
+        if h:
+            parts.append(f"{h} hour{'s' if h != 1 else ''}")
+        if m:
+            parts.append(f"{m} minute{'s' if m != 1 else ''}")
+        if s and seconds < 60 or (s and not (d or h or m)):
+            # show seconds when <60, or when it's the only unit
+            parts.append(f"{s} second{'s' if s != 1 else ''}")
+        return " ".join(parts) if parts else "0 seconds"
 
 
 async def setup(bot: commands.Bot):
