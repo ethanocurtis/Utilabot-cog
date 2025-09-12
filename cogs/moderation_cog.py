@@ -2,7 +2,7 @@
 import re
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from cogs.admin_gates import gated
 
 import discord
@@ -24,11 +24,7 @@ class Moderation(commands.Cog):
     """
     Moderation utilities:
       - /purge (bulk recent, <=14 days)
-      - /purge_all (wipe entire channel):
-          strategies:
-            - auto (bulk recent, slow older with pacing)
-            - safe (all slow with pacing)
-            - nuke (recreate channel, delete old)  <-- fastest/quietest
+      - /purge_all (wipe entire channel, skips pinned; bulk for recent + paced slow delete for older)
       - /autodelete set|disable|status|list
       - runtime deletion (per-message if <60s, periodic sweep for >=60s)
 
@@ -158,29 +154,18 @@ class Moderation(commands.Cog):
     # ---------- /purge_all (all history, any age) ----------
     @app_commands.command(
         name="purge_all",
-        description="Delete ALL messages in this channel using a chosen strategy (skips pinned)."
+        description="Delete ALL messages in this channel, regardless of age (skips pinned)."
     )
     @app_commands.describe(
         confirm="Must be true to proceed (safety check).",
-        strategy="auto (default), safe, or nuke",
-        user="Optional: only delete messages by this user",
-        pace_seconds="For slow deletes: delay between deletes (default 1.5s; increase to reduce 429s)."
-    )
-    @app_commands.choices(
-        strategy=[
-            app_commands.Choice(name="auto (bulk recent + slow older)", value="auto"),
-            app_commands.Choice(name="safe (all slow, minimal burst)", value="safe"),
-            app_commands.Choice(name="nuke (recreate channel; fastest)", value="nuke"),
-        ]
+        user="Optional: only delete messages by this user"
     )
     @gated()
     async def purge_all(
         self,
         inter: discord.Interaction,
         confirm: bool,
-        strategy: app_commands.Choice[str] = None,
         user: Optional[discord.User] = None,
-        pace_seconds: Optional[float] = None,
     ):
         if not await self._require_text_channel(inter):
             return
@@ -193,9 +178,6 @@ class Moderation(commands.Cog):
                 "⚠️ Confirmation required. Re-run with `confirm: true`.", ephemeral=True
             )
 
-        strat = (strategy.value if strategy else "auto").lower()
-        pace = max(0.5, float(pace_seconds or 1.5))  # default 1.5s per delete; raise if you still see 429s
-
         # Permission sanity
         try:
             perms = inter.channel.permissions_for(inter.guild.me) if inter.guild else None
@@ -203,27 +185,11 @@ class Moderation(commands.Cog):
                 return await inter.response.send_message(
                     "I need **Manage Messages** and **Read Message History**.", ephemeral=True
                 )
-            if strat == "nuke" and not perms.manage_channels:
-                return await inter.response.send_message(
-                    "For **nuke** strategy I also need **Manage Channels**.", ephemeral=True
-                )
         except Exception:
             pass
 
         await inter.response.defer(ephemeral=True, thinking=True)
 
-        if strat == "nuke":
-            try:
-                deleted_total = await self._nuke_channel(inter)
-                return await inter.followup.send(
-                    f"💣 Channel recreated. Old channel deleted. ({deleted_total} message history removed)", ephemeral=True
-                )
-            except Exception as e:
-                return await inter.followup.send(
-                    f"❌ Nuke failed: {e}. Try `strategy: auto` instead.", ephemeral=True
-                )
-
-        # Deletion filters & helpers
         cutoff = datetime.now(timezone.utc) - timedelta(days=14)
 
         def check(m: discord.Message):
@@ -235,27 +201,6 @@ class Moderation(commands.Cog):
 
         total_deleted = 0
 
-        # SAFE: only slow path with pacing
-        if strat == "safe":
-            try:
-                async for m in inter.channel.history(limit=None, oldest_first=False):
-                    if not check(m):
-                        continue
-                    try:
-                        await m.delete()
-                        total_deleted += 1
-                    except discord.HTTPException:
-                        # extra backoff if we tripped a rate-limit edge
-                        await asyncio.sleep(pace * 2)
-                        continue
-                    await asyncio.sleep(pace)
-            except Exception as e:
-                return await inter.followup.send(
-                    f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**.", ephemeral=True
-                )
-            return await inter.followup.send(f"🧨 Purge complete (safe). Deleted **{total_deleted}** messages.", ephemeral=True)
-
-        # AUTO: bulk for recent, slow for older
         # 1) FAST PATH: bulk purge everything newer than 14 days
         try:
             while True:
@@ -266,79 +211,38 @@ class Moderation(commands.Cog):
                     bulk=True
                 )
                 total_deleted += len(batch)
+                # If we deleted less than the max, we've likely exhausted the after=cutoff range
                 if len(batch) < 1000:
                     break
-                await asyncio.sleep(0.8)  # small pause between bulk rounds
+                # short pause between bulk rounds
+                await asyncio.sleep(0.5)
         except Exception:
-            pass  # fall through to slow path regardless
+            # If bulk purge fails for some reason, we fall through to slow path for the rest
+            pass
 
-        # 2) SLOW PATH: delete everything older than 14d, one-by-one with pacing + backoff
+        # 2) SLOW PATH: delete everything older than 14 days, one-by-one with pacing
         try:
+            deleted_slow = 0
             async for m in inter.channel.history(limit=None, oldest_first=False, before=cutoff):
                 if not check(m):
                     continue
                 try:
                     await m.delete()
+                    deleted_slow += 1
                     total_deleted += 1
-                except discord.HTTPException:
-                    # If we hit a 429 edge, give a longer breather
-                    await asyncio.sleep(pace * 2.5)
-                    continue
-                await asyncio.sleep(pace)
+                except Exception:
+                    # swallow individual failures
+                    pass
+
+                # Pacing to keep 429s manageable
+                if deleted_slow % 5 == 0:
+                    await asyncio.sleep(1.2)
         except Exception as e:
             return await inter.followup.send(
                 f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**.", ephemeral=True
             )
 
         await inter.followup.send(f"🧨 Purge complete. Deleted **{total_deleted}** messages.", ephemeral=True)
-
-    async def _nuke_channel(self, inter: discord.Interaction) -> int:
-        """
-        Recreate the current text channel with the same settings, move it into place,
-        archive + delete the old one. Returns a best-effort count of messages removed (if known).
-        """
-        ch = inter.channel
-        assert isinstance(ch, discord.TextChannel)
-        guild = ch.guild
-
-        # Snapshot channel props
-        name = ch.name
-        topic = ch.topic
-        category = ch.category
-        nsfw = ch.is_nsfw()
-        slowmode = ch.slowmode_delay
-        position = ch.position
-        overwrites = ch.overwrites
-
-        # Create the replacement
-        new_ch = await guild.create_text_channel(
-            name=name,
-            topic=topic,
-            category=category,
-            nsfw=nsfw,
-            slowmode_delay=slowmode,
-            overwrites=overwrites,
-            position=position
-        )
-
-        # Move the new channel to the same position (position may need a second set)
-        try:
-            await new_ch.edit(position=position)
-        except Exception:
-            pass
-
-        # Rename + delete the old channel
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-        try:
-            await ch.edit(name=f"{name}-archived-{timestamp}")
-        except Exception:
-            pass
-
-        # Delete the old channel (one API call, removes entire history)
-        await ch.delete()
-
-        # Done. (We can’t know message count without iterating; return -1 as sentinel)
-        return -1
 
     # ---------- /autodelete set|disable|status|list ----------
     @app_commands.command(name="autodelete", description="Manage auto-delete for this channel (set/disable/status/list).")
@@ -387,6 +291,7 @@ class Moderation(commands.Cog):
                     "No channels have auto-delete configured.", ephemeral=True
                 )
 
+            # Build rows only for this guild; include text channels and threads
             rows = []
             for cid, secs in ad_map.items():
                 ch = self.bot.get_channel(int(cid))
@@ -402,7 +307,7 @@ class Moderation(commands.Cog):
                     "No channels in this guild have auto-delete configured.", ephemeral=True
                 )
 
-            rows.sort(key=lambda t: t[0])
+            rows.sort(key=lambda t: t[0])  # sort by lowercase name
             lines = [f"{mention} → {self._pretty_seconds(secs)}" for _, mention, secs in rows]
             text = "\n".join(lines)
             return await inter.response.send_message(
@@ -455,8 +360,10 @@ class Moderation(commands.Cog):
     # ---------- deletion runtime ----------
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # Skip system/DMs
         if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
             return
+        # Bot perms needed
         try:
             perms = message.channel.permissions_for(message.guild.me) if message.guild else None
             if not perms or not perms.manage_messages:
@@ -466,6 +373,7 @@ class Moderation(commands.Cog):
         try:
             secs = self._ad_get_for_channel(message.channel.id)
             if secs and secs < 60:
+                # schedule per-message delete
                 asyncio.create_task(self._schedule_autodelete(message, secs))
         except Exception:
             pass
@@ -473,6 +381,7 @@ class Moderation(commands.Cog):
     async def _schedule_autodelete(self, message: discord.Message, seconds: int):
         try:
             await asyncio.sleep(max(1, int(seconds)))
+            # re-fetch and respect pins
             try:
                 msg = await message.channel.fetch_message(message.id)
             except Exception:
@@ -494,7 +403,7 @@ class Moderation(commands.Cog):
             now = datetime.now(timezone.utc)
             for chan_id, secs in list(conf.items()):
                 if secs < 60:
-                    continue
+                    continue  # handled per-message
                 channel = self.bot.get_channel(int(chan_id))
                 if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                     continue
@@ -506,13 +415,13 @@ class Moderation(commands.Cog):
                     continue
                 cutoff = now - timedelta(seconds=int(secs))
                 try:
+                    # delete messages older than cutoff (skip pinned)
                     async for m in channel.history(limit=200, before=None, oldest_first=False):
                         if getattr(m, "pinned", False):
                             continue
                         if m.created_at and m.created_at.replace(tzinfo=timezone.utc) <= cutoff:
                             try:
                                 await m.delete()
-                                await asyncio.sleep(0.2)  # tiny pacing in sweeper
                             except Exception:
                                 pass
                 except Exception:
@@ -537,6 +446,7 @@ class Moderation(commands.Cog):
             return None
         s = s.strip().lower()
 
+        # Plain number means minutes
         if re.fullmatch(r"\d+", s):
             return int(s) * 60
 
@@ -567,6 +477,7 @@ class Moderation(commands.Cog):
             parts.append(f"{h} hour{'s' if h != 1 else ''}")
         if m:
             parts.append(f"{m} minute{'s' if m != 1 else ''}")
+        # show seconds when <60, or when seconds exist but no larger units
         if s and (seconds < 60 or not (d or h or m)):
             parts.append(f"{s} second{'s' if s != 1 else ''}")
         return " ".join(parts) if parts else "0 seconds"
