@@ -1,11 +1,9 @@
-
 # cogs/moderation.py
 import re
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict
 from cogs.admin_gates import gated
-
 
 import discord
 from discord import app_commands
@@ -134,6 +132,7 @@ class Moderation(commands.Cog):
             return await inter.response.send_message(
                 "You need **Administrator/Manage Server** or be on the bot's admin allowlist.", ephemeral=True
             )
+
         def check(m: discord.Message):
             if getattr(m, "pinned", False):
                 return False
@@ -190,16 +189,36 @@ class Moderation(commands.Cog):
                 return await inter.response.send_message(
                     "You need **Administrator/Manage Server** or be on the bot's admin allowlist.", ephemeral=True
                 )
+
             ad_map = self._ad_get_map()
             if not ad_map:
-                return await inter.response.send_message("No channels have auto-delete configured.", ephemeral=True)
-            lines = []
+                return await inter.response.send_message(
+                    "No channels have auto-delete configured.", ephemeral=True
+                )
+
+            # Build rows only for this guild; include text channels and threads
+            rows = []
             for cid, secs in ad_map.items():
-                channel = inter.guild.get_channel(int(cid)) if inter.guild else None
-                name = f"#{channel.name}" if channel else f"<#{cid}>"
-                lines.append(f"{name} → {self._pretty_seconds(int(secs))}")
+                ch = self.bot.get_channel(int(cid))
+                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    continue
+                if not inter.guild or not ch.guild or ch.guild.id != inter.guild.id:
+                    continue
+                # Prefer a stable human name for sorting
+                name = getattr(ch, "name", str(cid))
+                rows.append((name.lower(), ch.mention, int(secs)))
+
+            if not rows:
+                return await inter.response.send_message(
+                    "No channels in this guild have auto-delete configured.", ephemeral=True
+                )
+
+            rows.sort(key=lambda t: t[0])  # sort by lowercase name
+            lines = [f"{mention} → {self._pretty_seconds(secs)}" for _, mention, secs in rows]
             text = "\n".join(lines)
-            return await inter.response.send_message(f"**Auto-delete list:**\n{text}", ephemeral=True)
+            return await inter.response.send_message(
+                f"**Auto-delete list (this guild):**\n{text}", ephemeral=True
+            )
 
         # set/disable require admin/allowlist + store
         if not self._is_admin_or_allowlisted(inter):
