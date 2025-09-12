@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Any
 
@@ -47,9 +48,11 @@ class StickyConfig:
     embed: Optional[StickyEmbedSpec] = None
     pinned: bool = False
     cooldown_messages: int = 0  # Only re-post after this many non-bot messages
+    cooldown_seconds: int = 0   # Only re-post after this many seconds (time gate)
     enabled: bool = True
     last_message_id: Optional[int] = None  # The current sticky message id
     messages_since: int = 0
+    last_post_time: float = 0.0
     author_id: Optional[int] = None  # who set it
 
     def to_dict(self) -> Dict[str, Any]:
@@ -116,9 +119,11 @@ class StickyStore:
             embed=embed,
             pinned=raw.get("pinned", False),
             cooldown_messages=raw.get("cooldown_messages", 0),
+            cooldown_seconds=raw.get("cooldown_seconds", 0),
             enabled=raw.get("enabled", True),
             last_message_id=raw.get("last_message_id"),
             messages_since=raw.get("messages_since", 0),
+            last_post_time=raw.get("last_post_time", 0.0),
             author_id=raw.get("author_id"),
         )
 
@@ -154,30 +159,35 @@ class StickyStore:
 # =========================
 class StickyCog(commands.Cog):
     """
-    Sticky Notes Cog
+    Sticky Notes Cog with text & embed modes, pinning, per-channel config,
+    message-count & time-based cooldowns, edit/show/list, enable/disable,
+    pin toggle, and optional role-gated permissions.
 
-    Requirements:
-    - Bot should have Manage Messages to delete/repost stickies.
-    - If `pinned=True`, bot needs Manage Messages to pin/unpin.
-    - For best results, enable Message Content intent (not strictly required).
+    Permissions required:
+    - Send Messages (always)
+    - Manage Messages (to delete old sticky and pin/unpin)
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.store = StickyStore(CONFIG_PATH)
-        self.allowed_role_cache: Dict[int, Optional[int]] = {}  # guild_id -> role_id or None
+        self.allowed_role_cache: Dict[int, Optional[int]] = {}
         self._ready = False
         self._message_lock = asyncio.Lock()
 
     async def cog_load(self):
         await self.store.load()
 
-    # ------------- Permissions helpers -------------
+    # -------------------- Permissions helpers --------------------
     def _has_manage_perms(self, interaction: discord.Interaction) -> bool:
         if interaction.user is None or not isinstance(interaction.user, discord.Member):
             return False
         m: discord.Member = interaction.user
-        if m.guild_permissions.administrator or m.guild_permissions.manage_guild or m.guild_permissions.manage_messages:
+        if (
+            m.guild_permissions.administrator
+            or m.guild_permissions.manage_guild
+            or m.guild_permissions.manage_messages
+        ):
             return True
         # Optional role gate
         rid = self.allowed_role_cache.get(interaction.guild_id or 0)
@@ -185,16 +195,25 @@ class StickyCog(commands.Cog):
             return True
         return False
 
-    # ------------- Command tree -------------
+    # -------------------- Command tree --------------------
     sticky = app_commands.Group(name="sticky", description="Manage sticky notes in this channel")
 
+    # --------- Create / Update stickies ---------
     @sticky.command(name="set-text", description="Set a text sticky in this channel")
     @app_commands.describe(
         message="The sticky text",
         pinned="Pin the sticky message (bot needs Manage Messages)",
         cooldown_messages="Repost only after this many non-bot messages (0 = every message)",
+        cooldown_seconds="Minimum seconds between refreshes (0 = no time limit)",
     )
-    async def set_text(self, interaction: discord.Interaction, message: str, pinned: bool = False, cooldown_messages: app_commands.Range[int, 0, 100] = 0):
+    async def set_text(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+        pinned: bool = False,
+        cooldown_messages: app_commands.Range[int, 0, 100] = 0,
+        cooldown_seconds: app_commands.Range[int, 0, 86400] = 0,
+    ):
         if not self._has_manage_perms(interaction):
             return await interaction.response.send_message("You lack permission to manage stickies.", ephemeral=True)
         channel = interaction.channel
@@ -207,14 +226,15 @@ class StickyCog(commands.Cog):
             embed=None,
             pinned=pinned,
             cooldown_messages=int(cooldown_messages or 0),
+            cooldown_seconds=int(cooldown_seconds or 0),
             enabled=True,
             last_message_id=None,
             messages_since=0,
+            last_post_time=0.0,
             author_id=interaction.user.id,
         )
         await self.store.set_config(interaction.guild_id, channel.id, cfg)
         await interaction.response.send_message("Sticky set. I will keep it at the bottom.", ephemeral=True)
-        # Immediately (re)post a fresh sticky
         await self._refresh_sticky(channel, cfg)
 
     @sticky.command(name="set-embed", description="Set an embed sticky in this channel")
@@ -227,16 +247,21 @@ class StickyCog(commands.Cog):
         footer="Optional footer text",
         pinned="Pin the sticky message",
         cooldown_messages="Repost only after this many non-bot messages (0 = every message)",
+        cooldown_seconds="Minimum seconds between refreshes (0 = no time limit)",
     )
-    async def set_embed(self, interaction: discord.Interaction,
-                        description: str,
-                        title: Optional[str] = None,
-                        color_hex: Optional[str] = None,
-                        thumbnail_url: Optional[str] = None,
-                        image_url: Optional[str] = None,
-                        footer: Optional[str] = None,
-                        pinned: bool = False,
-                        cooldown_messages: app_commands.Range[int, 0, 100] = 0):
+    async def set_embed(
+        self,
+        interaction: discord.Interaction,
+        description: str,
+        title: Optional[str] = None,
+        color_hex: Optional[str] = None,
+        thumbnail_url: Optional[str] = None,
+        image_url: Optional[str] = None,
+        footer: Optional[str] = None,
+        pinned: bool = False,
+        cooldown_messages: app_commands.Range[int, 0, 100] = 0,
+        cooldown_seconds: app_commands.Range[int, 0, 86400] = 0,
+    ):
         if not self._has_manage_perms(interaction):
             return await interaction.response.send_message("You lack permission to manage stickies.", ephemeral=True)
         channel = interaction.channel
@@ -265,9 +290,11 @@ class StickyCog(commands.Cog):
             text=None,
             pinned=pinned,
             cooldown_messages=int(cooldown_messages or 0),
+            cooldown_seconds=int(cooldown_seconds or 0),
             enabled=True,
             last_message_id=None,
             messages_since=0,
+            last_post_time=0.0,
             author_id=interaction.user.id,
         )
         await self.store.set_config(interaction.guild_id, channel.id, cfg)
@@ -295,32 +322,13 @@ class StickyCog(commands.Cog):
             else:
                 cfg.embed.description = new_text
 
-        # Reset runtime so we re-post immediately
-        cfg.last_message_id = None
+        cfg.last_message_id = None  # force refresh
         cfg.messages_since = 0
         await self.store.set_config(interaction.guild_id, channel.id, cfg)
         await interaction.response.send_message("Sticky updated.", ephemeral=True)
         await self._refresh_sticky(channel, cfg)
 
-    @sticky.command(name="show", description="Show the current sticky config")
-    async def show(self, interaction: discord.Interaction):
-        channel = interaction.channel
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            return await interaction.response.send_message("This command only works in text channels or threads.", ephemeral=True)
-        cfg = await self.store.get_config(interaction.guild_id, channel.id)
-        if not cfg:
-            return await interaction.response.send_message("No sticky configured in this channel.", ephemeral=True)
-
-        desc = f"Mode: **{cfg.mode}**\nPinned: **{cfg.pinned}**\nCooldown messages: **{cfg.cooldown_messages}**\nEnabled: **{cfg.enabled}**"
-        if cfg.mode == "text" and cfg.text:
-            desc += f"\n\nPreview (text):\n{cfg.text[:4000]}"
-        elif cfg.mode == "embed" and cfg.embed:
-            desc += "\n\nPreview below."
-        await interaction.response.send_message(desc, ephemeral=True)
-        # Send preview embed (ephemeral messages can include embeds)
-        if cfg.mode == "embed" and cfg.embed:
-            await interaction.followup.send(embed=cfg.embed.to_embed(), ephemeral=True)
-
+    # --------- Enable/Disable & Pin ---------
     @sticky.command(name="disable", description="Disable the sticky in this channel")
     async def disable(self, interaction: discord.Interaction):
         if not self._has_manage_perms(interaction):
@@ -357,34 +365,6 @@ class StickyCog(commands.Cog):
         await interaction.response.send_message("Sticky enabled.", ephemeral=True)
         await self._refresh_sticky(channel, cfg)
 
-    @sticky.command(name="list", description="List all active stickies in this server")
-    async def list_cmd(self, interaction: discord.Interaction):
-        if not self._has_manage_perms(interaction):
-            return await interaction.response.send_message("You lack permission to list stickies.", ephemeral=True)
-        if not interaction.guild_id:
-            return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        items = await self.store.list_channels(interaction.guild_id)
-        if not items:
-            return await interaction.response.send_message("No stickies configured in this server.", ephemeral=True)
-        lines = []
-        for ch_id, cfg in items.items():
-            lines.append(f"<#{ch_id}> — mode **{cfg.mode}**, pinned **{cfg.pinned}**, cooldown **{cfg.cooldown_messages}**, enabled **{cfg.enabled}**")
-        await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
-
-    @sticky.command(name="cooldown", description="Set the message-count cooldown for this channel's sticky")
-    @app_commands.describe(count="Repost only after this many non-bot messages (0 = every message)")
-    async def cooldown(self, interaction: discord.Interaction, count: app_commands.Range[int, 0, 100]):
-        if not self._has_manage_perms(interaction):
-            return await interaction.response.send_message("You lack permission to manage stickies.", ephemeral=True)
-        channel = interaction.channel
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            return await interaction.response.send_message("This command only works in text channels or threads.", ephemeral=True)
-        cfg = await self.store.get_config(interaction.guild_id, channel.id)
-        if not cfg:
-            return await interaction.response.send_message("No sticky configured in this channel.", ephemeral=True)
-        await self.store.update_runtime(interaction.guild_id, channel.id, cooldown_messages=int(count))
-        await interaction.response.send_message(f"Cooldown set to {int(count)} messages.", ephemeral=True)
-
     @sticky.command(name="pin", description="Enable or disable pinning of the sticky message in this channel")
     @app_commands.describe(value="Whether the sticky should be pinned")
     async def pin_toggle(self, interaction: discord.Interaction, value: bool):
@@ -402,7 +382,78 @@ class StickyCog(commands.Cog):
         await interaction.response.send_message(f"Pinning is now {'enabled' if value else 'disabled'}.", ephemeral=True)
         await self._refresh_sticky(channel, cfg)
 
-    # Optional: restrict management to a specific role (per guild)
+    # --------- Cooldowns ---------
+    @sticky.command(name="cooldown", description="Set the message-count cooldown for this channel's sticky")
+    @app_commands.describe(count="Repost only after this many non-bot messages (0 = every message)")
+    async def cooldown(self, interaction: discord.Interaction, count: app_commands.Range[int, 0, 100]):
+        if not self._has_manage_perms(interaction):
+            return await interaction.response.send_message("You lack permission to manage stickies.", ephemeral=True)
+        channel = interaction.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return await interaction.response.send_message("This command only works in text channels or threads.", ephemeral=True)
+        cfg = await self.store.get_config(interaction.guild_id, channel.id)
+        if not cfg:
+            return await interaction.response.send_message("No sticky configured in this channel.", ephemeral=True)
+        await self.store.update_runtime(interaction.guild_id, channel.id, cooldown_messages=int(count))
+        await interaction.response.send_message(f"Cooldown (messages) set to {int(count)}.", ephemeral=True)
+
+    @sticky.command(name="cooldown-time", description="Set the time-based cooldown (seconds) for this channel's sticky")
+    @app_commands.describe(seconds="Minimum seconds between sticky refreshes (0 = no time limit)")
+    async def cooldown_time(self, interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 86400]):
+        if not self._has_manage_perms(interaction):
+            return await interaction.response.send_message("You lack permission to manage stickies.", ephemeral=True)
+        channel = interaction.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return await interaction.response.send_message("This command only works in text channels or threads.", ephemeral=True)
+        cfg = await self.store.get_config(interaction.guild_id, channel.id)
+        if not cfg:
+            return await interaction.response.send_message("No sticky configured in this channel.", ephemeral=True)
+        await self.store.update_runtime(interaction.guild_id, channel.id, cooldown_seconds=int(seconds))
+        await interaction.response.send_message(f"Cooldown (time) set to {int(seconds)} seconds.", ephemeral=True)
+
+    # --------- Visibility & Permissions ---------
+    @sticky.command(name="show", description="Show the current sticky config (ephemeral preview)")
+    async def show(self, interaction: discord.Interaction):
+        channel = interaction.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return await interaction.response.send_message("This command only works in text channels or threads.", ephemeral=True)
+        cfg = await self.store.get_config(interaction.guild_id, channel.id)
+        if not cfg:
+            return await interaction.response.send_message("No sticky configured in this channel.", ephemeral=True)
+
+        desc = (
+            f"Mode: **{cfg.mode}**\n"
+            f"Pinned: **{cfg.pinned}**\n"
+            f"Cooldown messages: **{cfg.cooldown_messages}**\n"
+            f"Cooldown seconds: **{cfg.cooldown_seconds}**\n"
+            f"Enabled: **{cfg.enabled}**"
+        )
+        if cfg.mode == "text" and cfg.text:
+            desc += f"\n\nPreview (text):\n{cfg.text[:4000]}"
+        elif cfg.mode == "embed" and cfg.embed:
+            desc += "\n\nPreview below."
+        await interaction.response.send_message(desc, ephemeral=True)
+        if cfg.mode == "embed" and cfg.embed:
+            await interaction.followup.send(embed=cfg.embed.to_embed(), ephemeral=True)
+
+    @sticky.command(name="list", description="List all active stickies in this server")
+    async def list_cmd(self, interaction: discord.Interaction):
+        if not self._has_manage_perms(interaction):
+            return await interaction.response.send_message("You lack permission to list stickies.", ephemeral=True)
+        if not interaction.guild_id:
+            return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        items = await self.store.list_channels(interaction.guild_id)
+        if not items:
+            return await interaction.response.send_message("No stickies configured in this server.", ephemeral=True)
+        lines = []
+        for ch_id, cfg in items.items():
+            lines.append(
+                f"<#{ch_id}> — mode **{cfg.mode}**, pinned **{cfg.pinned}**, "
+                f"cooldown_msgs **{cfg.cooldown_messages}**, cooldown_sec **{cfg.cooldown_seconds}**, "
+                f"enabled **{cfg.enabled}**"
+            )
+        await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
+
     @sticky.command(name="perm-role", description="(Optional) Set a role allowed to manage stickies on this server")
     @app_commands.describe(role="Role that can manage stickies (in addition to admins/mods)")
     async def perm_role(self, interaction: discord.Interaction, role: Optional[discord.Role]):
@@ -416,10 +467,9 @@ class StickyCog(commands.Cog):
             f"Sticky manager role set to: {role.mention if role else 'None'}", ephemeral=True
         )
 
-    # ------------- Runtime behavior -------------
+    # -------------------- Runtime behavior --------------------
     @commands.Cog.listener()
     async def on_ready(self):
-        # Load once more in case cog loaded before ready
         await self.store.load()
         self._ready = True
 
@@ -444,11 +494,17 @@ class StickyCog(commands.Cog):
         cfg.messages_since = (cfg.messages_since or 0) + 1
         await self.store.update_runtime(message.guild.id, channel.id, messages_since=cfg.messages_since)
 
-        threshold = cfg.cooldown_messages or 0
-        if threshold == 0 or cfg.messages_since >= threshold:
+        # Check thresholds (AND logic)
+        threshold_msgs = cfg.cooldown_messages or 0
+        threshold_time = cfg.cooldown_seconds or 0
+        now = time.time()
+        msgs_ok = threshold_msgs == 0 or cfg.messages_since >= threshold_msgs
+        time_ok = threshold_time == 0 or (now - (cfg.last_post_time or 0)) >= threshold_time
+
+        if msgs_ok and time_ok:
             await self._refresh_sticky(channel, cfg)
 
-    # ------------- Helpers -------------
+    # -------------------- Helpers --------------------
     async def _delete_existing_sticky_message(self, channel: discord.abc.MessageableChannel, cfg: StickyConfig):
         if not cfg.last_message_id:
             return
@@ -487,10 +543,14 @@ class StickyCog(commands.Cog):
                         await msg.pin(reason="Sticky message")
                     except Exception:
                         pass
-                # Save new message id & reset counter
-                await self.store.update_runtime(channel.guild.id, channel.id,
-                                               last_message_id=msg.id,
-                                               messages_since=0)
+                # Save new message id & reset counters
+                await self.store.update_runtime(
+                    channel.guild.id,
+                    channel.id,
+                    last_message_id=msg.id,
+                    messages_since=0,
+                    last_post_time=time.time(),
+                )
             except discord.Forbidden:
                 # Lacking perms
                 if isinstance(channel, (discord.TextChannel, discord.Thread)):
