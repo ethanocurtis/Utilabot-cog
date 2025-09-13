@@ -416,7 +416,7 @@ Messages processed (this run): **{state.processed_messages:,}**"""
             interaction.guild,
             notify_user_id=interaction.user.id if interaction.user else None,
             notify_channel_id=interaction.channel.id if interaction.channel else None,
-        )))
+        ))
 
     @group.command(name="backfill_status", description="Show backfill progress for this server")
     async def backfill_status(self, interaction: discord.Interaction):
