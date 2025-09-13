@@ -436,6 +436,7 @@ Messages processed (this run): **{state.processed_messages:,}**"""
     async def serverstats(self, interaction: discord.Interaction, rng: Optional[str] = "30d"):
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
+        await interaction.response.defer()  # avoid Unknown interaction by deferring fast
         start, end = self._parse_range((rng or "30d").lower())
         total, users = await self.db.totals(interaction.guild.id, start, end)
         per_ch = await self.db.per_channel_totals(interaction.guild.id, start, end)
@@ -459,9 +460,9 @@ Messages processed (this run): **{state.processed_messages:,}**"""
                 file = await self._chart_daily(series, f"stats_{interaction.guild.id}_{rng}.png")
                 e.set_image(url=f"attachment://{file.filename}")
         if file:
-            await interaction.response.send_message(embed=e, file=file)
+            await interaction.followup.send(embed=e, file=file)
         else:
-            await interaction.response.send_message(embed=e)
+            await interaction.followup.send(embed=e)
 
     @group.command(name="topchatters", description="Top users by messages")
     @app_commands.describe(rng="7d/30d/90d/all", channel="Optional channel filter", limit="# of users to show (1-25)")
@@ -480,14 +481,15 @@ Messages processed (this run): **{state.processed_messages:,}**"""
             lines.append(f"{name}: **{c:,}**")
         e = discord.Embed(title=f"Top Chatters — {rng}{' in ' + channel.mention if channel else ''}", color=discord.Color.gold())
         e.description = "\n".join(lines)
-        await interaction.response.send_message(embed=e)
+        await interaction.followup.send(embed=e)
 
     @group.command(name="channelstats", description="Stats for a specific channel")
     @app_commands.describe(channel="Channel to analyze", rng="7d/30d/90d/all")
     async def channelstats(self, interaction: discord.Interaction, channel: discord.TextChannel, rng: Optional[str] = "30d"):
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
-        start, end = self._parse_range((rng or "30d").lower())
+        await interaction.response.defer()
+        start, end = self._parse_range((rng or "30d").lower()).lower())
         series = await self.db.daily_series(interaction.guild.id, start, end, channel.id)
         total = sum(c for _, c in series)
         e = discord.Embed(title=f"{channel.mention} — {rng}", color=discord.Color.green())
@@ -497,9 +499,9 @@ Messages processed (this run): **{state.processed_messages:,}**"""
             file = await self._chart_daily(series, f"chan_{channel.id}_{rng}.png")
             e.set_image(url=f"attachment://{file.filename}")
         if file:
-            await interaction.response.send_message(embed=e, file=file)
+            await interaction.followup.send(embed=e, file=file)
         else:
-            await interaction.response.send_message(embed=e)
+            await interaction.followup.send(embed=e)
 
     @group.command(name="heatmap", description="Hourly × weekday heatmap of activity (server-wide)")
     @app_commands.describe(rng="7d/30d/90d/all")
@@ -508,11 +510,12 @@ Messages processed (this run): **{state.processed_messages:,}**"""
             return await interaction.response.send_message("Heatmap requires matplotlib installed.")
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
-        start, end = self._parse_range((rng or "30d").lower())
+        await interaction.response.defer()
+        start, end = self._parse_range((rng or "30d").lower()).lower())
         # Aggregate hourly from daily sample is impossible → we need per-message timestamps for precise heatmap.
         # As a compromise, we will approximate using recent cache (live) + a note.
         e = discord.Embed(title=f"Heatmap (approx) — {rng}", description="Approximation using recent activity. For exact heatmaps, extend DB to store hourly buckets.", color=discord.Color.purple())
-        await interaction.response.send_message(embed=e)
+        await interaction.followup.send(embed=e)
 
     # --------------- Charting ---------------
     async def _chart_daily(self, series: List[Tuple[str, int]], filename: str) -> Optional[discord.File]:
