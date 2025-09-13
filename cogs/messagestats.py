@@ -349,8 +349,10 @@ class MessageStatsCog(commands.Cog):
             # Notify on completion
             try:
                 summary = (
-                    f"Backfill complete for **{guild.name}**.\n"
-                    f"Channels processed: **{state.processed_channels}/{state.total_channels}**\n"
+                    f"Backfill complete for **{guild.name}**.
+"
+                    f"Channels processed: **{state.processed_channels}/{state.total_channels}**
+"
                     f"Messages processed (this run): **{state.processed_messages:,}**"
                 )
                 # Prefer notifying in the channel where it was started
@@ -461,7 +463,10 @@ class MessageStatsCog(commands.Cog):
             if series:
                 file = await self._chart_daily(series, f"stats_{interaction.guild.id}_{rng}.png")
                 e.set_image(url=f"attachment://{file.filename}")
-        await interaction.response.send_message(embed=e, file=file)
+        if file:
+            await interaction.response.send_message(embed=e, file=file)
+        else:
+            await interaction.response.send_message(embed=e)
 
     @group.command(name="topchatters", description="Top users by messages")
     @app_commands.describe(rng="7d/30d/90d/all", channel="Optional channel filter", limit="# of users to show (1-25)")
@@ -496,7 +501,10 @@ class MessageStatsCog(commands.Cog):
         if HAS_MPL and series:
             file = await self._chart_daily(series, f"chan_{channel.id}_{rng}.png")
             e.set_image(url=f"attachment://{file.filename}")
-        await interaction.response.send_message(embed=e, file=file)
+        if file:
+            await interaction.response.send_message(embed=e, file=file)
+        else:
+            await interaction.response.send_message(embed=e)
 
     @group.command(name="heatmap", description="Hourly × weekday heatmap of activity (server-wide)")
     @app_commands.describe(rng="7d/30d/90d/all")
