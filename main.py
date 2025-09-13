@@ -33,6 +33,7 @@ COGS = [
     "cogs.minecraft",
     "cogs.mc_todo",
     "cogs.stickynotes",
+    "cogs.messagestats",
 ]
 
 class UtilaBot(commands.Bot):
