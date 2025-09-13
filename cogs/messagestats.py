@@ -16,7 +16,10 @@ from discord.ext import commands, tasks
 
 # Optional charting
 try:
+    import matplotlib
+    matplotlib.use("Agg")  # headless, non-interactive backend
     import matplotlib.pyplot as plt  # type: ignore
+    from matplotlib.ticker import MaxNLocator  # type: ignore
     HAS_MPL = True
 except Exception:  # pragma: no cover
     HAS_MPL = False
@@ -72,7 +75,7 @@ class LRURecent:
 # Storage
 # ==============================
 class StatsDB:
-    def __init__(self, path: str):
+    def __init__(self, path: str):(self, path: str):
         self.path = path
         self._lock = asyncio.Lock()
         self._conn: Optional[sqlite3.Connection] = None
@@ -117,6 +120,20 @@ class StatsDB:
             """
         )
         self._conn.commit()
+
+    async def clear_channel(self, guild_id: int, channel_id: int):
+        async with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM messages_daily WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+            cur.execute("DELETE FROM backfill_progress WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+            self._conn.commit()
+
+    async def clear_guild(self, guild_id: int):
+        async with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM messages_daily WHERE guild_id=?", (guild_id,))
+            cur.execute("DELETE FROM backfill_progress WHERE guild_id=?", (guild_id,))
+            self._conn.commit()
 
     async def close(self):
         if self._conn:
@@ -303,15 +320,16 @@ class MessageStatsCog(commands.Cog):
                 chans.append(ch)
         return chans
 
-    async def _backfill_channel(self, guild: discord.Guild, channel: discord.TextChannel, state: BackfillState):
+    async def _backfill_channel(self, guild: discord.Guild, channel: discord.TextChannel, state: BackfillState, resume_after: Optional[int] = None, include_bots: bool = False):
         batch: List[Tuple[int, int, int, str, int]] = []
         CHUNK_COMMIT = 500
         state.current_channel_id = channel.id
         last_id = None
         try:
-            async for m in channel.history(limit=None, oldest_first=True):
-                if m.author.bot:
-                    continue  # exclude bots by default; adjust if you want to include
+            after_obj = discord.Object(id=resume_after) if resume_after else None
+            async for m in channel.history(limit=None, oldest_first=True, after=after_obj):
+                if m.author.bot and not include_bots:
+                    continue  # exclude bots unless include_bots=True
                 day = ymd(m.created_at)
                 batch.append((guild.id, channel.id, m.author.id, day, 1))
                 self.recent.put(m)
@@ -331,18 +349,29 @@ class MessageStatsCog(commands.Cog):
             state.last_error = f"{channel.id}: {e.__class__.__name__}: {e}"
             await self.db.mark_progress(guild.id, channel.id, last_id, done=False)
 
-    async def _backfill_guild(self, guild: discord.Guild, notify_user_id: Optional[int] = None, notify_channel_id: Optional[int] = None):
+    async def _backfill_guild(self, guild: discord.Guild, notify_user_id: Optional[int] = None, notify_channel_id: Optional[int] = None, only_channel_id: Optional[int] = None, force: bool = False, include_bots: bool = False):
         state = self.backfills[guild.id]
         state.running = True
         try:
             channels = await self._channels_in_guild(guild)
+            if only_channel_id:
+                channels = [c for c in channels if c.id == only_channel_id]
             state.total_channels = len(channels)
             state.processed_channels = 0
             state.processed_messages = 0
+            progress = await self.db.get_progress(guild.id)
             for ch in channels:
                 if not state.running:
                     break
-                await self._backfill_channel(guild, ch, state)
+                # Skip if already done and not forcing
+                last_id, done = progress.get(ch.id, (None, False)) if progress else (None, False)
+                if done and not force:
+                    state.processed_channels += 1
+                    continue
+                # If forcing, clear prior counts for this channel
+                if force:
+                    await self.db.clear_channel(guild.id, ch.id)
+                await self._backfill_channel(guild, ch, state, resume_after=last_id, include_bots=include_bots)
                 state.processed_channels += 1
             state.running = False
             state.current_channel_id = None
@@ -391,13 +420,17 @@ Messages processed (this run): **{state.processed_messages:,}**"""
     # --------------- Commands ---------------
     group = app_commands.Group(name="msgstats", description="Message statistics & backfill")
 
-    @group.command(name="backfill_start", description="Backfill ALL accessible channel history in this server")
-    async def backfill_start(self, interaction: discord.Interaction):
+    @group.command(name="backfill_start", description="Backfill history (server or a specific channel). Skips already completed channels unless force=true.")
+    @app_commands.describe(channel="Optional channel to backfill only this channel",
+                           force="If true, clears prior counts for the target before refilling",
+                           include_bots="Count bot messages as well")
+    async def backfill_start(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None, force: Optional[bool] = False, include_bots: Optional[bool] = False):
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Manage Server required.", ephemeral=True)
         state = self.backfills[interaction.guild.id]
+        state.last_error = None
         if state.running:
             # Ensure we don't double-respond
             if interaction.response.is_done():
@@ -416,7 +449,10 @@ Messages processed (this run): **{state.processed_messages:,}**"""
             interaction.guild,
             notify_user_id=interaction.user.id if interaction.user else None,
             notify_channel_id=interaction.channel.id if interaction.channel else None,
-        ))
+            only_channel_id=(channel.id if channel else None),
+            force=bool(force),
+            include_bots=bool(include_bots),
+        )))
 
     @group.command(name="backfill_status", description="Show backfill progress for this server")
     async def backfill_status(self, interaction: discord.Interaction):
@@ -541,14 +577,23 @@ Messages processed (this run): **{state.processed_messages:,}**"""
             return None
         days = [d for d, _ in series]
         counts = [c for _, c in series]
-        plt.figure(figsize=(8, 3))
-        plt.plot(days, counts)
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        plt.close()
-        buf.seek(0)
+
+        def _render():
+            import matplotlib.pyplot as _plt  # local import for thread safety
+            from matplotlib.ticker import MaxNLocator as _MaxNLocator
+            fig = _plt.figure(figsize=(8, 3))
+            ax = _plt.gca()
+            ax.plot(days, counts)
+            ax.xaxis.set_major_locator(_MaxNLocator(nbins=8, prune='both'))
+            _plt.xticks(rotation=45, ha='right')
+            _plt.tight_layout()
+            _buf = io.BytesIO()
+            fig.savefig(_buf, format='png')
+            _plt.close(fig)
+            _buf.seek(0)
+            return _buf
+
+        buf = await asyncio.to_thread(_render)
         return discord.File(buf, filename=filename)
 
 
