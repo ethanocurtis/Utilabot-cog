@@ -395,15 +395,28 @@ Messages processed (this run): **{state.processed_messages:,}**"""
     async def backfill_start(self, interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
-        await interaction.response.defer()
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Manage Server required.", ephemeral=True)
         state = self.backfills[interaction.guild.id]
         if state.running:
+            # Ensure we don't double-respond
+            if interaction.response.is_done():
+                return await interaction.followup.send("Backfill is already running.")
             return await interaction.response.send_message("Backfill is already running.", ephemeral=True)
-        await interaction.response.send_message("Starting backfill… I'll crunch through history in the background.", ephemeral=True)
-        # Run in background (per requirements: we must perform task now in code; the bot will do it asynchronously in runtime)
-        self.bot.loop.create_task(self._backfill_guild(interaction.guild, notify_user_id=interaction.user.id if interaction.user else None, notify_channel_id=interaction.channel.id if interaction.channel else None))
+        # Try to send an ephemeral ack; if already responded, fall back to followup
+        try:
+            await interaction.response.send_message("Starting backfill… I'll crunch through history in the background.", ephemeral=True)
+        except discord.InteractionResponded:
+            try:
+                await interaction.followup.send("Starting backfill… I'll crunch through history in the background.")
+            except Exception:
+                pass
+        # Kick off the job
+        self.bot.loop.create_task(self._backfill_guild(
+            interaction.guild,
+            notify_user_id=interaction.user.id if interaction.user else None,
+            notify_channel_id=interaction.channel.id if interaction.channel else None,
+        )))
 
     @group.command(name="backfill_status", description="Show backfill progress for this server")
     async def backfill_status(self, interaction: discord.Interaction):
