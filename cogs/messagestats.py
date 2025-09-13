@@ -331,7 +331,7 @@ class MessageStatsCog(commands.Cog):
             state.last_error = f"{channel.id}: {e.__class__.__name__}: {e}"
             await self.db.mark_progress(guild.id, channel.id, last_id, done=False)
 
-    async def _backfill_guild(self, guild: discord.Guild):
+    async def _backfill_guild(self, guild: discord.Guild, notify_user_id: Optional[int] = None, notify_channel_id: Optional[int] = None):
         state = self.backfills[guild.id]
         state.running = True
         try:
@@ -346,6 +346,27 @@ class MessageStatsCog(commands.Cog):
                 state.processed_channels += 1
             state.running = False
             state.current_channel_id = None
+            # Notify on completion
+            try:
+                summary = (
+                    f"Backfill complete for **{guild.name}**.\n"
+                    f"Channels processed: **{state.processed_channels}/{state.total_channels}**\n"
+                    f"Messages processed (this run): **{state.processed_messages:,}**"
+                )
+                # Prefer notifying in the channel where it was started
+                if notify_channel_id:
+                    ch = guild.get_channel(notify_channel_id)
+                    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                        await ch.send(summary)
+                # Also DM the requester if possible
+                if notify_user_id:
+                    user = guild.get_member(notify_user_id) or (await guild.fetch_member(notify_user_id))
+                    try:
+                        await user.send(summary)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         finally:
             state.running = False
             state.current_channel_id = None
@@ -384,7 +405,7 @@ class MessageStatsCog(commands.Cog):
             return await interaction.response.send_message("Backfill is already running.", ephemeral=True)
         await interaction.response.send_message("Starting backfill… I'll crunch through history in the background.", ephemeral=True)
         # Run in background (per requirements: we must perform task now in code; the bot will do it asynchronously in runtime)
-        self.bot.loop.create_task(self._backfill_guild(interaction.guild))
+        self.bot.loop.create_task(self._backfill_guild(interaction.guild, notify_user_id=interaction.user.id if interaction.user else None, notify_channel_id=interaction.channel.id if interaction.channel else None))
 
     @group.command(name="backfill_status", description="Show backfill progress for this server")
     async def backfill_status(self, interaction: discord.Interaction):
