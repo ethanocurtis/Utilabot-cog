@@ -348,13 +348,9 @@ class MessageStatsCog(commands.Cog):
             state.current_channel_id = None
             # Notify on completion
             try:
-                summary = (
-                    f"Backfill complete for **{guild.name}**.
-"
-                    f"Channels processed: **{state.processed_channels}/{state.total_channels}**
-"
-                    f"Messages processed (this run): **{state.processed_messages:,}**"
-                )
+                summary = f"""Backfill complete for **{guild.name}**.
+Channels processed: **{state.processed_channels}/{state.total_channels}**
+Messages processed (this run): **{state.processed_messages:,}**"""
                 # Prefer notifying in the channel where it was started
                 if notify_channel_id:
                     ch = guild.get_channel(notify_channel_id)
@@ -373,7 +369,6 @@ class MessageStatsCog(commands.Cog):
             state.running = False
             state.current_channel_id = None
 
-    # --------------- Listeners ---------------
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot:
