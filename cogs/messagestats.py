@@ -489,7 +489,7 @@ Messages processed (this run): **{state.processed_messages:,}**"""
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
         await interaction.response.defer()
-        start, end = self._parse_range((rng or "30d").lower()).lower())
+        start, end = self._parse_range((rng or "30d").lower())
         series = await self.db.daily_series(interaction.guild.id, start, end, channel.id)
         total = sum(c for _, c in series)
         e = discord.Embed(title=f"{channel.mention} — {rng}", color=discord.Color.green())
@@ -511,7 +511,7 @@ Messages processed (this run): **{state.processed_messages:,}**"""
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
         await interaction.response.defer()
-        start, end = self._parse_range((rng or "30d").lower()).lower())
+        start, end = self._parse_range((rng or "30d").lower())
         # Aggregate hourly from daily sample is impossible → we need per-message timestamps for precise heatmap.
         # As a compromise, we will approximate using recent cache (live) + a note.
         e = discord.Embed(title=f"Heatmap (approx) — {rng}", description="Approximation using recent activity. For exact heatmaps, extend DB to store hourly buckets.", color=discord.Color.purple())
