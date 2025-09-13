@@ -395,6 +395,7 @@ Messages processed (this run): **{state.processed_messages:,}**"""
     async def backfill_start(self, interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
+        await interaction.response.defer()
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Manage Server required.", ephemeral=True)
         state = self.backfills[interaction.guild.id]
@@ -466,14 +467,18 @@ Messages processed (this run): **{state.processed_messages:,}**"""
 
     @group.command(name="topchatters", description="Top users by messages")
     @app_commands.describe(rng="7d/30d/90d/all", channel="Optional channel filter", limit="# of users to show (1-25)")
-    async def topchatters(self, interaction: discord.Interaction, rng: Optional[str] = "30d", channel: Optional[discord.TextChannel] = None, limit: Optional[int] = 10):
+    async def topchatters(self, interaction: discord.Interaction, rng: Optional[str] = "30d", channel: Optional[discord.TextChannel] = None, limit: int = 10):
+        if not interaction.guild:
+            return await interaction.response.send_message("Use in a server.", ephemeral=True)
+        await interaction.response.defer()
+        start, end = self._parse_range((rng or "30d").lower())
         if not interaction.guild:
             return await interaction.response.send_message("Use in a server.", ephemeral=True)
         limit = max(1, min(int(limit or 10), 25))
         start, end = self._parse_range((rng or "30d").lower())
         rows = await self.db.top_chatters(interaction.guild.id, start, end, channel.id if channel else None, limit)
         if not rows:
-            return await interaction.response.send_message("No data yet.")
+            return await interaction.followup.send("No data yet.")
         lines = []
         for uid, c in rows:
             member = interaction.guild.get_member(uid)
