@@ -89,7 +89,7 @@ async def mc_status(kind: str, host: str, port: Optional[int]) -> Tuple[bool, Di
             data = {
                 "motd": getattr(status.description, "to_plain", lambda: str(status.description))(),
                 "version": getattr(status.version, "name", str(status.version)),
-                "latency": getattr(status, "latency", None),
+                # removed latency capture since we don't display ping anymore
                 "players_online": status.players.online,
                 "players_max": status.players.max,
                 "sample": [p.name for p in (status.players.sample or [])],
@@ -102,7 +102,6 @@ async def mc_status(kind: str, host: str, port: Optional[int]) -> Tuple[bool, Di
             data = {
                 "motd": status.motd,
                 "version": status.version.brand + " " + status.version.version,
-                "latency": None,
                 "players_online": status.players_online,
                 "players_max": status.players_max,
                 "sample": [],  # Bedrock ping doesn't provide names
@@ -521,6 +520,8 @@ class PanelView(discord.ui.View):
 class MinecraftCog(commands.Cog):
     """Minecraft RCON control panel (Java/Bedrock status + rich RCON command runner)."""
 
+    GRASS_ICON = "https://static.wikia.nocookie.net/minecraft_gamepedia/images/5/51/Grass_Block_JE2_BE2.png"
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.configs: Dict[str, ServerConfig] = load_all_configs()
@@ -544,7 +545,9 @@ class MinecraftCog(commands.Cog):
             description=("Live status" if simple else "Live status • RCON controls"),
             color=discord.Color.blurple(),
         )
-        embed.set_thumbnail(url="https://static.wikia.nocookie.net/minecraft_gamepedia/images/5/51/Grass_Block_JE2_BE2.png")
+        # Add grass block visuals (author icon + thumbnail)
+        embed.set_author(name="Minecraft Server", icon_url=self.GRASS_ICON)
+        embed.set_thumbnail(url=self.GRASS_ICON)
 
         if not cfg:
             embed.description = "Not configured yet. Use `/mc setup`."
@@ -552,8 +555,15 @@ class MinecraftCog(commands.Cog):
 
         ok, data = await mc_status(cfg.kind, cfg.host, cfg.port)
         show_port = effective_port(cfg.kind, cfg.port)
+
+        # Build a display address that hides default 25565 for Java
+        if cfg.kind == "java" and show_port == 25565:
+            display_addr = f"{cfg.host}"
+        else:
+            display_addr = f"{cfg.host}:{show_port}"
+
         if ok:
-            status_line = f"**Online** `{cfg.host}:{show_port}`"
+            status_line = f"**Online** `{display_addr}`"
             embed.add_field(name="Status", value=status_line, inline=False)
 
             # Hide MOTD when simple=True, show it otherwise.
@@ -562,12 +572,10 @@ class MinecraftCog(commands.Cog):
                 embed.add_field(name="MOTD", value=f"```{motd}```", inline=False)
 
             version = data.get("version") or "—"
-            latency = data.get("latency")
-            ping = f"{round(latency)} ms" if latency is not None else "—"
             players = f"{data.get('players_online', 0)}/{data.get('players_max','?')}"
 
             embed.add_field(name="Version", value=version, inline=True)
-            embed.add_field(name="Ping", value=ping, inline=True)
+            # Removed the Ping field as requested
             embed.add_field(name="Players", value=players, inline=True)
 
             # Always show player list (even in simple mode)
@@ -581,7 +589,7 @@ class MinecraftCog(commands.Cog):
         else:
             embed.add_field(
                 name="Status",
-                value=f"**Offline / Unreachable** `{cfg.host}:{show_port}`\n```{data.get('error','unknown error')}```",
+                value=f"**Offline / Unreachable** `{display_addr}`\n```{data.get('error','unknown error')}```",
                 inline=False,
             )
 
