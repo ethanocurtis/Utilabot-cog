@@ -47,7 +47,6 @@ def load_all_configs() -> Dict[str, ServerConfig]:
         raw = json.load(f)
     out: Dict[str, ServerConfig] = {}
     for gid, obj in raw.items():
-        # drop unknown keys to be future-proof
         allowed = {
             "kind","host","port","rcon_host","rcon_port","rcon_password","properties_path",
             "sticky_channel_id","sticky_message_id","sticky_interval_min",
@@ -89,7 +88,7 @@ async def mc_status(kind: str, host: str, port: Optional[int]) -> Tuple[bool, Di
             data = {
                 "motd": getattr(status.description, "to_plain", lambda: str(status.description))(),
                 "version": getattr(status.version, "name", str(status.version)),
-                # removed latency capture since we don't display ping anymore
+                # ping removed from embed; no need to record latency anymore
                 "players_online": status.players.online,
                 "players_max": status.players.max,
                 "sample": [p.name for p in (status.players.sample or [])],
@@ -118,10 +117,6 @@ async def mc_status(kind: str, host: str, port: Optional[int]) -> Tuple[bool, Di
 # RCON helpers (no thread)
 # =========================
 async def rcon_exec(host: str, port: int, password: str, command: str) -> Tuple[bool, str]:
-    """
-    Execute a command via RCON in the event loop thread
-    (mcrcon's signal usage can fail in thread pools).
-    """
     try:
         with MCRcon(host, password, port=port) as rcon:
             resp = rcon.command(command)
@@ -131,16 +126,13 @@ async def rcon_exec(host: str, port: int, password: str, command: str) -> Tuple[
 
 
 async def rcon_stop_sequence(host: str, port: int, password: str, *, warn_secs: int = 5) -> Tuple[bool, str]:
-    """Graceful stop: announce → save-all flush → stop."""
     ok, resp = await rcon_exec(host, port, password, f"say Server stopping in {warn_secs}s… Please log out safely.")
     if not ok:
         return False, f"announce failed: {resp}"
     await asyncio.sleep(max(0, warn_secs))
-
     ok, resp = await rcon_exec(host, port, password, "save-all flush")
     if not ok:
         return False, f"save failed: {resp}"
-
     ok, resp = await rcon_exec(host, port, password, "stop")
     if not ok:
         return False, f"stop failed: {resp}"
@@ -148,15 +140,12 @@ async def rcon_stop_sequence(host: str, port: int, password: str, *, warn_secs: 
 
 
 async def rcon_player_names_if_available(cfg: ServerConfig) -> List[str]:
-    """Best-effort parse of Java 'list' output into player names."""
     if cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
         return []
     rp = effective_port(cfg.kind, cfg.rcon_port)
     ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, "list")
     if not ok or not resp:
         return []
-    # Common format: "There are X of a max of Y players online: name1, name2, name3"
-    # We'll split on colon if present and then commas.
     part = resp.split(":", 1)
     names_blob = part[1] if len(part) > 1 else ""
     names = [n.strip() for n in names_blob.split(",") if n.strip()]
@@ -168,30 +157,23 @@ async def rcon_player_names_if_available(cfg: ServerConfig) -> List[str]:
 # =========================
 class RconCmd:
     def __init__(self, key: str, label: str, template: str, fields: Optional[List[Dict]] = None, danger: bool = False):
-        self.key = key            # unique id
-        self.label = label        # dropdown label
-        self.template = template  # template like "ban {name} {reason}"
-        self.fields = fields or []  # [{"id","label","placeholder","min","max","required"}]
+        self.key = key
+        self.label = label
+        self.template = template
+        self.fields = fields or []
         self.danger = danger
 
 
 RCON_COMMANDS: List[RconCmd] = [
-    # Info / chat
     RconCmd("list", "Player list", "list"),
     RconCmd("say", "Broadcast message", "say {msg}", fields=[{"id": "msg", "label": "Message", "placeholder": "Server restarting soon!", "min":1, "max":200, "required": True}]),
-
-    # Whitelist
     RconCmd("wl_on", "Whitelist ON", "whitelist on"),
     RconCmd("wl_off", "Whitelist OFF", "whitelist off"),
     RconCmd("wl_add", "Whitelist add <name>", "whitelist add {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
     RconCmd("wl_remove", "Whitelist remove <name>", "whitelist remove {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
     RconCmd("wl_list", "Whitelist list", "whitelist list"),
-
-    # Permissions
     RconCmd("op", "OP <name>", "op {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
     RconCmd("deop", "DEOP <name>", "deop {name}", fields=[{"id":"name","label":"Player name","placeholder":"Steve","min":2,"max":16,"required":True}]),
-
-    # Moderation
     RconCmd("kick", "Kick <name> [reason]", "kick {name} {reason}", fields=[
         {"id":"name","label":"Player name","placeholder":"Griefer123","min":2,"max":16,"required":True},
         {"id":"reason","label":"Reason (optional)","placeholder":"Keep it short","min":0,"max":60,"required":False},
@@ -201,15 +183,11 @@ RCON_COMMANDS: List[RconCmd] = [
         {"id":"reason","label":"Reason (optional)","placeholder":"Griefing","min":0,"max":60,"required":False},
     ]),
     RconCmd("pardon", "Pardon <name>", "pardon {name}", fields=[{"id":"name","label":"Player name","placeholder":"Friend","min":2,"max":16,"required":True}]),
-
-    # Gameplay (handled by choice UIs)
     RconCmd("difficulty", "Difficulty (pick)", "difficulty {level}"),
     RconCmd("gamemode", "Default gamemode (pick)", "defaultgamemode {mode}"),
     RconCmd("weather", "Weather (pick)", "weather {kind}"),
     RconCmd("time", "Time set (pick)", "time set {value}"),
     RconCmd("gamerule_preset", "Gamerule presets (pick/toggle)", "gamerule {rule} {value}"),
-
-    # Utility
     RconCmd("tp", "Teleport <target> <destination>", "tp {target} {dest}", fields=[
         {"id":"target","label":"Target selector or player","placeholder":"Player | @a | @p","min":1,"max":32,"required":True},
         {"id":"dest","label":"Destination","placeholder":"Player | x y z","min":1,"max":64,"required":True},
@@ -218,8 +196,6 @@ RCON_COMMANDS: List[RconCmd] = [
     RconCmd("save_flush", "Save-all flush", "save-all flush"),
     RconCmd("save_on", "Save-on", "save-on"),
     RconCmd("save_off", "Save-off", "save-off"),
-
-    # Power
     RconCmd("stop", "STOP server (confirm)", "stop", danger=True),
 ]
 
@@ -317,7 +293,6 @@ class TimeChoiceView(discord.ui.View):
     async def midnight(self, i: discord.Interaction, _): await self._run(i, "midnight")
 
 
-# A small list of popular gamerules to toggle quickly
 GAMERULE_PRESETS = [
     ("keepInventory", ["true", "false"]),
     ("doDaylightCycle", ["true", "false"]),
@@ -325,7 +300,7 @@ GAMERULE_PRESETS = [
     ("doMobGriefing", ["true", "false"]),
     ("doFireTick", ["true", "false"]),
     ("doImmediateRespawn", ["true", "false"]),
-    ("showCoordinates", ["true", "false"]),  # harmless if not present
+    ("showCoordinates", ["true", "false"]),
 ]
 
 class GamerulePresetView(discord.ui.View):
@@ -354,52 +329,14 @@ class GameruleValueSelect(discord.ui.Select):
         cfg = self.cog.configs.get(str(self.guild_id))
         if not cfg or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ RCON not configured.", ephemeral=True)
-
         rule = getattr(self.view, "selected_rule", None)
         if not rule:
             return await interaction.response.send_message("Pick a gamerule first.", ephemeral=True)
-
         rp = effective_port(cfg.kind, cfg.rcon_port)
         value = self.values[0]
         await interaction.response.defer(ephemeral=True, thinking=True)
         ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, f"gamerule {rule} {value}")
         await interaction.followup.send((f"✅ `gamerule {rule} {value}`\n```{resp}```" if ok else f"❌ Failed: `{resp}`"), ephemeral=True)
-
-
-# =========================
-# UI: Generic modal for commands with fields
-# =========================
-class CommandModal(discord.ui.Modal):
-    def __init__(self, cog: "MinecraftCog", guild_id: int, cmd: RconCmd):
-        super().__init__(title=f"Run: {cmd.label}")
-        self.cog = cog
-        self.guild_id = guild_id
-        self.cmd = cmd
-        self.inputs: Dict[str, discord.ui.TextInput] = {}
-        for f in cmd.fields:
-            ti = discord.ui.TextInput(
-                label=f["label"],
-                placeholder=f.get("placeholder", ""),
-                required=f.get("required", True),
-                min_length=f.get("min", None),
-                max_length=f.get("max", None),
-            )
-            self.inputs[f["id"]] = ti
-            self.add_item(ti)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        cfg = self.cog.configs.get(str(self.guild_id))
-        if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
-            return await interaction.response.send_message("⚠️ Java + RCON required and must be configured.", ephemeral=True)
-
-        values = {fid: (str(inp.value).strip() if inp.value is not None else "") for fid, inp in self.inputs.items()}
-        command = self.cmd.template.format(**values).strip()
-
-        rp = effective_port(cfg.kind, cfg.rcon_port)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, command)
-        msg = f"✅ Ran `{command}`.\n```{resp}```" if ok else f"❌ `{command}` failed:\n`{resp}`"
-        await interaction.followup.send(msg, ephemeral=True)
 
 
 # =========================
@@ -432,7 +369,6 @@ class ConfirmStopView(discord.ui.View):
 
 
 class RconSelect(discord.ui.Select):
-    """Dropdown of RCON commands; opens a choice view or modal if needed."""
     def __init__(self, cog: "MinecraftCog", guild_id: int):
         self.cog = cog
         self.guild_id = guild_id
@@ -452,7 +388,6 @@ class RconSelect(discord.ui.Select):
         if not cfg or cfg.kind != "java" or not (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password):
             return await interaction.response.send_message("⚠️ Java + RCON required and must be configured.", ephemeral=True)
 
-        # Pre-filled choice UIs
         if cmd.key == "difficulty":
             return await interaction.response.send_message("Pick a difficulty:", view=DifficultyChoiceView(self.cog, self.guild_id), ephemeral=True)
         if cmd.key == "gamemode":
@@ -464,7 +399,6 @@ class RconSelect(discord.ui.Select):
         if cmd.key == "gamerule_preset":
             return await interaction.response.send_message("Gamerule presets:", view=GamerulePresetView(self.cog, self.guild_id), ephemeral=True)
 
-        # Danger commands get a confirm
         if cmd.danger:
             return await interaction.response.send_message(
                 "Are you sure you want to **stop** the server? (save-all + stop)",
@@ -472,11 +406,9 @@ class RconSelect(discord.ui.Select):
                 ephemeral=True,
             )
 
-        # Commands with fields → open modal
         if cmd.fields:
             return await interaction.response.send_modal(CommandModal(self.cog, self.guild_id, cmd))
 
-        # No fields → run immediately
         rp = effective_port(cfg.kind, cfg.rcon_port)
         await interaction.response.defer(ephemeral=True, thinking=True)
         ok, resp = await rcon_exec(cfg.rcon_host, rp, cfg.rcon_password, cmd.template)
@@ -520,12 +452,12 @@ class PanelView(discord.ui.View):
 class MinecraftCog(commands.Cog):
     """Minecraft RCON control panel (Java/Bedrock status + rich RCON command runner)."""
 
-    GRASS_ICON = "https://static.wikia.nocookie.net/minecraft_gamepedia/images/5/51/Grass_Block_JE2_BE2.png"
+    # More reliable grass block icon (GitHub raw)
+    GRASS_ICON = "https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/master/assets/minecraft/textures/block/grass_block_top.png"
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.configs: Dict[str, ServerConfig] = load_all_configs()
-        # sticky scheduling memory: next-due epoch per guild id (str)
         self._sticky_next: Dict[str, float] = {}
         self._sticky_updater.start()
 
@@ -541,11 +473,10 @@ class MinecraftCog(commands.Cog):
         cfg = self.configs.get(gid)
 
         embed = discord.Embed(
-            title="Minecraft Server Panel",
-            description=("Live status" if simple else "Live status • RCON controls"),
+            title="Minecraft Server Status",
+            description=None,  # removed "Live status" line
             color=discord.Color.blurple(),
         )
-        # Add grass block visuals (author icon + thumbnail)
         embed.set_author(name="Minecraft Server", icon_url=self.GRASS_ICON)
         embed.set_thumbnail(url=self.GRASS_ICON)
 
@@ -556,29 +487,27 @@ class MinecraftCog(commands.Cog):
         ok, data = await mc_status(cfg.kind, cfg.host, cfg.port)
         show_port = effective_port(cfg.kind, cfg.port)
 
-        # Build a display address that hides default 25565 for Java
+        # Hide default 25565 for Java; keep 19132 for Bedrock unless non-default
         if cfg.kind == "java" and show_port == 25565:
             display_addr = f"{cfg.host}"
+        elif cfg.kind == "bedrock" and show_port == 19132:
+            display_addr = f"{cfg.host}"  # also hide Bedrock default for consistency
         else:
             display_addr = f"{cfg.host}:{show_port}"
 
         if ok:
-            status_line = f"**Online** `{display_addr}`"
-            embed.add_field(name="Status", value=status_line, inline=False)
+            embed.add_field(name="Status", value=f"**Online** `{display_addr}`", inline=False)
 
-            # Hide MOTD when simple=True, show it otherwise.
             if not simple:
                 motd = data.get("motd") or "—"
                 embed.add_field(name="MOTD", value=f"```{motd}```", inline=False)
 
             version = data.get("version") or "—"
             players = f"{data.get('players_online', 0)}/{data.get('players_max','?')}"
-
             embed.add_field(name="Version", value=version, inline=True)
-            # Removed the Ping field as requested
             embed.add_field(name="Players", value=players, inline=True)
 
-            # Always show player list (even in simple mode)
+            # Names list
             sample = data.get("sample") or []
             if not sample:
                 sample = await rcon_player_names_if_available(cfg)
@@ -596,12 +525,11 @@ class MinecraftCog(commands.Cog):
         hints: List[str] = []
         hints.append("RCON ready" if (cfg.rcon_host and cfg.rcon_port and cfg.rcon_password) else "RCON not set")
         if cfg.sticky_channel_id and cfg.sticky_interval_min:
-            hints.append(f"Sticky: #{cfg.sticky_channel_id} / {cfg.sticky_interval_min}m")
+            hints.append(f"Sticky: every {cfg.sticky_interval_min}m")
         embed.set_footer(text=" • ".join(hints))
         return embed
 
     async def _refresh_sticky_for_guild(self, gid: str) -> None:
-        """Create or edit the sticky status message for a guild."""
         cfg = self.configs.get(gid)
         if not cfg or not cfg.sticky_channel_id or not cfg.sticky_interval_min:
             return
@@ -612,16 +540,13 @@ class MinecraftCog(commands.Cog):
 
         channel = guild.get_channel(cfg.sticky_channel_id)
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            # channel missing or wrong type → disable sticky to avoid loop spam
             cfg.sticky_channel_id = None
             cfg.sticky_message_id = None
             save_all_configs(self.configs)
             return
 
-        # Build embed (simple=True hides MOTD but keeps player list)
         embed = await self.build_status_embed(guild.id, simple=True)
 
-        # Try to edit existing message; if not found/forbidden, send a new one
         msg = None
         if cfg.sticky_message_id:
             try:
@@ -631,7 +556,7 @@ class MinecraftCog(commands.Cog):
 
         if msg:
             try:
-                await msg.edit(content="‎", embed=embed)  # zero-width char to keep content non-empty
+                await msg.edit(content="‎", embed=embed)  # zero-width char
             except discord.HTTPException:
                 msg = None
 
@@ -652,21 +577,18 @@ class MinecraftCog(commands.Cog):
                 continue
             due = self._sticky_next.get(gid, 0)
             if now >= due:
-                # jitter protection: schedule next first, then run
                 self._sticky_next[gid] = now + (cfg.sticky_interval_min * 60)
                 try:
                     await self._refresh_sticky_for_guild(gid)
                 except Exception:
-                    # avoid crashing the loop; next tick will try again
                     pass
 
     @_sticky_updater.before_loop
     async def _before_sticky(self):
         await self.bot.wait_until_ready()
-        # prime the next times so they start soon after boot
         for gid, cfg in self.configs.items():
             if cfg.sticky_channel_id and cfg.sticky_interval_min:
-                self._sticky_next[gid] = time.time() + 10  # update ~10s after ready
+                self._sticky_next[gid] = time.time() + 10
 
     # ---------- slash commands ----------
     group = app_commands.Group(name="mc", description="Minecraft server controls")
@@ -695,7 +617,6 @@ class MinecraftCog(commands.Cog):
         rcon_port: Optional[int] = None,
         rcon_password: Optional[str] = None,
     ):
-        # fill default port if none provided
         if port is None:
             port = default_port_for(kind.value)
 
@@ -729,7 +650,6 @@ class MinecraftCog(commands.Cog):
         embed = await self.build_status_embed(interaction.guild_id)
         await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id))
 
-    # Convenience: soft restart via RCON stop
     @group.command(name="restart", description="Soft restart via RCON (save-all + stop). Requires external auto-restart.")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def cmd_restart(self, interaction: discord.Interaction):
@@ -752,7 +672,6 @@ class MinecraftCog(commands.Cog):
         else:
             await interaction.followup.send(f"❌ Restart failed: `{msg}`", ephemeral=True)
 
-    # Optional: quick ping
     @group.command(name="ping", description="Quick connectivity check")
     async def ping(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -763,7 +682,7 @@ class MinecraftCog(commands.Cog):
         ok, data = await mc_status(cfg.kind, cfg.host, cfg.port)
         await interaction.followup.send(("✅ Reachable." if ok else f"❌ Unreachable: `{data.get('error','unknown error')}`"), ephemeral=True)
 
-    # ---------- NEW: Sticky status commands ----------
+    # ---------- Sticky controls ----------
     @group.command(name="sticky_set", description="Enable/Update the sticky status in a channel (auto-updating embed).")
     @app_commands.describe(
         channel="Channel to pin the live status message in",
@@ -778,10 +697,7 @@ class MinecraftCog(commands.Cog):
 
         cfg.sticky_channel_id = channel.id
         cfg.sticky_interval_min = int(interval_minutes)
-        # message id will be set/updated on first run
         save_all_configs(self.configs)
-
-        # schedule immediate refresh
         self._sticky_next[gid] = time.time() + 1
         await interaction.response.send_message(f"✅ Sticky status set to {channel.mention} every **{interval_minutes}m**.", ephemeral=True)
 
