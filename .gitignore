@@ -1,0 +1,10 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
+
+# Minecraft cog runtime data (contains RCON host/credentials + stats history)
+data/minecraft_config.json
+data/minecraft_stats.db
