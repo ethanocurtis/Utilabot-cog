@@ -102,6 +102,9 @@ class ServerConfig:
     # Join/leave notification channel
     player_log_channel_id: Optional[int] = None
 
+    # Custom name shown in the status embed title/author (defaults to "Minecraft Server")
+    display_name: Optional[str] = None
+
 
 def load_all_configs() -> Dict[str, ServerConfig]:
     if not os.path.exists(CONFIG_PATH):
@@ -113,7 +116,7 @@ def load_all_configs() -> Dict[str, ServerConfig]:
         allowed = {
             "kind","host","port","rcon_host","rcon_port","rcon_password","properties_path",
             "sticky_channel_id","sticky_message_id","sticky_interval_min",
-            "player_log_channel_id",
+            "player_log_channel_id","display_name",
         }
         slim = {k: v for k, v in obj.items() if k in allowed}
         out[gid] = ServerConfig(**slim)
@@ -565,7 +568,8 @@ class RconSetupModal(discord.ui.Modal, title="RCON Password"):
     )
 
     def __init__(self, cog: "MinecraftCog", gid: str, kind: str, host: str, port: int,
-                 rcon_host: str, rcon_port: int, existing: Optional[ServerConfig]):
+                 rcon_host: str, rcon_port: int, existing: Optional[ServerConfig],
+                 display_name: Optional[str] = None):
         super().__init__()
         self.cog = cog
         self.gid = gid
@@ -575,6 +579,7 @@ class RconSetupModal(discord.ui.Modal, title="RCON Password"):
         self.rcon_host = rcon_host
         self.rcon_port = rcon_port
         self.existing = existing
+        self.display_name = display_name
 
     async def on_submit(self, interaction: discord.Interaction):
         new_password = self.password.value.strip()
@@ -599,6 +604,7 @@ class RconSetupModal(discord.ui.Modal, title="RCON Password"):
             sticky_message_id=self.existing.sticky_message_id if self.existing else None,
             sticky_interval_min=self.existing.sticky_interval_min if self.existing else None,
             player_log_channel_id=self.existing.player_log_channel_id if self.existing else None,
+            display_name=self.display_name,
         )
         self.cog.configs[self.gid] = cfg
         save_all_configs(self.cog.configs)
@@ -1016,9 +1022,10 @@ class MinecraftCog(commands.Cog):
     ) -> Tuple[discord.Embed, Optional[discord.File]]:
         gid = str(guild_id) if guild_id else "global"
         cfg = self.configs.get(gid)
+        display_name = (cfg.display_name if cfg and cfg.display_name else "Minecraft Server")
 
-        embed = discord.Embed(title="Minecraft Server Status", color=discord.Color.blurple())
-        embed.set_author(name="Minecraft Server", icon_url=self.GRASS_ICON)
+        embed = discord.Embed(title=f"{display_name} Status", color=discord.Color.blurple())
+        embed.set_author(name=display_name, icon_url=self.GRASS_ICON)
         embed.timestamp = discord.utils.utcnow()
 
         if not cfg:
@@ -1213,6 +1220,7 @@ class MinecraftCog(commands.Cog):
         port="Server port (optional; defaults 25565 Java / 19132 Bedrock)",
         rcon_host="RCON host (Java only)",
         rcon_port="RCON port (Java only)",
+        name="Custom name shown in the status embed (e.g. \"Ethan's SMP\"); leave blank to keep/use the default",
     )
     @app_commands.choices(kind=[
         app_commands.Choice(name="java", value="java"),
@@ -1227,18 +1235,20 @@ class MinecraftCog(commands.Cog):
         port: Optional[int] = None,
         rcon_host: Optional[str] = None,
         rcon_port: Optional[int] = None,
+        name: Optional[app_commands.Range[str, 1, 60]] = None,
     ):
         if port is None:
             port = default_port_for(kind.value)
 
         gid = str(interaction.guild_id)
         existing = self.configs.get(gid)
+        display_name = name if name is not None else (existing.display_name if existing else None)
 
         if rcon_host and rcon_port:
             # Collect the password via modal so it never appears in the
             # publicly-visible slash-command invocation line.
             return await interaction.response.send_modal(
-                RconSetupModal(self, gid, kind.value, host, port, rcon_host, rcon_port, existing)
+                RconSetupModal(self, gid, kind.value, host, port, rcon_host, rcon_port, existing, display_name)
             )
 
         cfg = ServerConfig(
@@ -1249,6 +1259,7 @@ class MinecraftCog(commands.Cog):
             sticky_message_id=existing.sticky_message_id if existing else None,
             sticky_interval_min=existing.sticky_interval_min if existing else None,
             player_log_channel_id=existing.player_log_channel_id if existing else None,
+            display_name=display_name,
         )
         self.configs[gid] = cfg
         save_all_configs(self.configs)
@@ -1259,6 +1270,21 @@ class MinecraftCog(commands.Cog):
             "- RCON: not set",
             ephemeral=True,
         )
+
+    @group.command(name="rename", description="Set (or clear) the custom name shown in the status embed")
+    @app_commands.describe(name="New display name (e.g. \"Ethan's SMP\"); omit to reset to the default")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def rename(self, interaction: discord.Interaction, name: Optional[app_commands.Range[str, 1, 60]] = None):
+        gid = str(interaction.guild_id)
+        cfg = self.configs.get(gid)
+        if not cfg:
+            return await interaction.response.send_message("⚠️ Not configured yet. Run `/mc setup` first.", ephemeral=True)
+        cfg.display_name = name
+        save_all_configs(self.configs)
+        if name:
+            await interaction.response.send_message(f"✅ Display name set to **{name}**.", ephemeral=True)
+        else:
+            await interaction.response.send_message("✅ Display name reset to the default (\"Minecraft Server\").", ephemeral=True)
 
     @group.command(name="status", description="Show live status and open the RCON panel")
     async def status(self, interaction: discord.Interaction):
@@ -1283,6 +1309,7 @@ class MinecraftCog(commands.Cog):
 
         show_port = effective_port(cfg.kind, cfg.port)
         lines = [
+            f"**Display name:** {cfg.display_name or 'Minecraft Server (default)'}",
             f"**Kind:** {cfg.kind}",
             f"**Address:** `{cfg.host}:{show_port}`",
             f"**RCON:** {'configured 🔒' if rcon_ready(cfg) else 'not set ⚠️'}",
