@@ -849,8 +849,9 @@ class PanelView(discord.ui.View):
 class MinecraftCog(commands.Cog):
     """Minecraft RCON control panel (Java/Bedrock status + rich RCON command runner)."""
 
-    # Auto-updating mirror of the vanilla assets; more durable than a personal repo.
-    GRASS_ICON = "https://raw.githubusercontent.com/misode/mcmeta/assets/assets/minecraft/textures/block/grass_block_top.png"
+    # Self-hosted (assets/grass_block_icon.png) — the raw vanilla texture is an
+    # untinted grayscale mask, so this is a pre-tinted, upscaled copy of it.
+    GRASS_ICON = "https://raw.githubusercontent.com/ethanocurtis/Utilabot-cog/main/assets/grass_block_icon.png"
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
