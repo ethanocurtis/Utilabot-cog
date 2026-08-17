@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -16,16 +17,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# External deps (install: pip install mcstatus mcrcon cryptography aiosqlite)
+# External deps (install: pip install mcstatus mcrcon cryptography aiosqlite Pillow)
 from mcstatus import JavaServer, BedrockServer
 from mcrcon import MCRcon
 from cryptography.fernet import Fernet, InvalidToken
+from PIL import Image, ImageDraw, ImageFont
 
 log = logging.getLogger(__name__)
 
 CONFIG_PATH = "data/minecraft_config.json"
 STATS_DB_PATH = "data/minecraft_stats.db"
 os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+
+ASSETS_DIR = "assets"
+GRASS_ICON_LOCAL = os.path.join(ASSETS_DIR, "grass_block_icon.png")
+BANNER_FONT_PATH = os.path.join(ASSETS_DIR, "fonts", "PressStart2P-Regular.ttf")
 
 
 # =========================
@@ -362,6 +368,136 @@ def sparkline(values: List[int]) -> str:
         return (_SPARK_CHARS[0] if hi == 0 else _SPARK_CHARS[4]) * len(values)
     span = hi - lo
     return "".join(_SPARK_CHARS[int((v - lo) / span * (len(_SPARK_CHARS) - 1))] for v in values)
+
+
+# =========================
+# Status banner image (embed.set_image) — pixel-art styled server card,
+# rendered with Pillow and attached to the message rather than hosted
+# externally, so it never depends on a third-party URL staying up.
+# =========================
+BANNER_W, BANNER_H = 900, 170
+BANNER_GROUND_H = 22
+BANNER_CORNER_RADIUS = 18
+
+_BANNER_BG_TOP = (20, 32, 22)
+_BANNER_BG_BOTTOM = (11, 15, 13)
+_BANNER_GREEN = (108, 210, 90)
+_BANNER_RED = (224, 90, 90)
+_BANNER_MUTED = (172, 180, 174)
+_BANNER_WHITE = (235, 240, 236)
+_BANNER_BAR_BG = (40, 48, 42)
+_BANNER_BAR_BORDER = (70, 82, 72)
+
+_banner_font_cache: Dict[int, ImageFont.FreeTypeFont] = {}
+
+
+def _banner_font(size: int) -> ImageFont.FreeTypeFont:
+    if size not in _banner_font_cache:
+        _banner_font_cache[size] = ImageFont.truetype(BANNER_FONT_PATH, size)
+    return _banner_font_cache[size]
+
+
+def _banner_vertical_gradient(w: int, h: int, top: Tuple[int, int, int], bottom: Tuple[int, int, int]) -> Image.Image:
+    base = Image.new("RGB", (w, h), top)
+    draw = ImageDraw.Draw(base)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        c = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+        draw.line([(0, y), (w, y)], fill=c)
+    return base
+
+
+def _banner_ground_strip(banner: Image.Image, grass_tile: Image.Image) -> None:
+    x = 0
+    while x < BANNER_W:
+        banner.paste(grass_tile, (x, BANNER_H - BANNER_GROUND_H), grass_tile)
+        x += BANNER_GROUND_H
+    ImageDraw.Draw(banner).line(
+        [(0, BANNER_H - BANNER_GROUND_H), (BANNER_W, BANNER_H - BANNER_GROUND_H)],
+        fill=(20, 60, 24), width=2,
+    )
+
+
+def _banner_text_shadow(draw: ImageDraw.ImageDraw, pos, text: str, font: ImageFont.FreeTypeFont, fill, offset: int = 2) -> None:
+    x, y = pos
+    draw.text((x + offset, y + offset), text, font=font, fill=(0, 0, 0, 150))
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _banner_capacity_bar(draw: ImageDraw.ImageDraw, x, y, w, h, frac: float, color) -> None:
+    frac = max(0.0, min(1.0, frac))
+    draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=_BANNER_BAR_BG, outline=_BANNER_BAR_BORDER, width=2)
+    if frac > 0:
+        fill_w = max(h, int(w * frac))
+        draw.rounded_rectangle([x, y, x + fill_w, y + h], radius=h // 2, fill=color)
+
+
+def _banner_round_corners(img: Image.Image, radius: int) -> Image.Image:
+    img = img.convert("RGBA")
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, img.width, img.height], radius=radius, fill=255)
+    out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+
+def _render_status_banner_sync(
+    *, online: bool, host: str, version: Optional[str], players: Optional[int], max_players: Optional[int],
+) -> bytes:
+    grass = Image.open(GRASS_ICON_LOCAL).convert("RGBA")
+
+    banner = _banner_vertical_gradient(BANNER_W, BANNER_H, _BANNER_BG_TOP, _BANNER_BG_BOTTOM).convert("RGBA")
+    _banner_ground_strip(banner, grass.resize((BANNER_GROUND_H, BANNER_GROUND_H), Image.NEAREST))
+    draw = ImageDraw.Draw(banner)
+
+    dot_color, label = (_BANNER_GREEN, "ONLINE") if online else (_BANNER_RED, "OFFLINE")
+
+    pad = 30
+    dot_r = 9
+    dot_cy = pad + 18
+    draw.ellipse([pad, dot_cy - dot_r, pad + dot_r * 2, dot_cy + dot_r], fill=dot_color)
+    _banner_text_shadow(draw, (pad + dot_r * 2 + 14, pad), label, _banner_font(24), _BANNER_WHITE)
+    _banner_text_shadow(draw, (pad, pad + 42), host[:38], _banner_font(13), _BANNER_MUTED)
+
+    if online and players is not None and max_players:
+        _banner_text_shadow(draw, (pad, pad + 72), f"{players} / {max_players} PLAYERS", _banner_font(13), _BANNER_WHITE)
+        _banner_capacity_bar(draw, pad, pad + 96, BANNER_W - pad * 2, 14, players / max_players, _BANNER_GREEN)
+
+    icon_size = 40
+    icon_x = BANNER_W - pad - icon_size
+    icon_img = grass.resize((icon_size, icon_size), Image.NEAREST)
+    banner.paste(icon_img, (icon_x, pad - 6), icon_img)
+    if version:
+        vtext = version[:16]
+        bbox = draw.textbbox((0, 0), vtext, font=_banner_font(11))
+        vw = bbox[2] - bbox[0]
+        _banner_text_shadow(draw, (icon_x + icon_size // 2 - vw // 2, pad - 6 + icon_size + 4), vtext, _banner_font(11), _BANNER_MUTED)
+
+    banner = _banner_round_corners(banner, BANNER_CORNER_RADIUS)
+    buf = io.BytesIO()
+    banner.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def render_status_banner(
+    *, online: bool, host: str, version: Optional[str] = None,
+    players: Optional[int] = None, max_players: Optional[int] = None,
+) -> Optional[discord.File]:
+    """Renders the status banner off the event loop. Returns None (instead of
+    raising) if the asset/font is missing or rendering otherwise fails, so a
+    banner problem never breaks the embed itself."""
+    loop = asyncio.get_running_loop()
+    try:
+        png_bytes = await loop.run_in_executor(
+            None,
+            lambda: _render_status_banner_sync(
+                online=online, host=host, version=version, players=players, max_players=max_players
+            ),
+        )
+    except Exception:
+        log.exception("Failed to render status banner")
+        return None
+    return discord.File(io.BytesIO(png_bytes), filename="mc_status.png")
 
 
 # =========================
@@ -819,8 +955,9 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄")
     async def refresh(self, interaction: discord.Interaction, _):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        embed = await self.cog.build_status_embed(interaction.guild_id)
-        await interaction.followup.send("Updated status:", embed=embed, ephemeral=True)
+        embed, file = await self.cog.build_status_embed(interaction.guild_id)
+        kwargs = {"file": file} if file else {}
+        await interaction.followup.send("Updated status:", embed=embed, ephemeral=True, **kwargs)
 
     @discord.ui.button(label="Copy IP", style=discord.ButtonStyle.secondary, emoji="📋")
     async def copy_ip(self, interaction: discord.Interaction, _):
@@ -874,22 +1011,20 @@ class MinecraftCog(commands.Cog):
                 log.exception("Failed to cancel background loop on unload.")
 
     # ---------- helpers ----------
-    async def build_status_embed(self, guild_id: Optional[int], *, simple: bool = False) -> discord.Embed:
+    async def build_status_embed(
+        self, guild_id: Optional[int], *, simple: bool = False
+    ) -> Tuple[discord.Embed, Optional[discord.File]]:
         gid = str(guild_id) if guild_id else "global"
         cfg = self.configs.get(gid)
 
-        embed = discord.Embed(
-            title="Minecraft Server Status",
-            description=None,  # removed "Live status" line
-            color=discord.Color.blurple(),
-        )
+        embed = discord.Embed(title="Minecraft Server Status", color=discord.Color.blurple())
         embed.set_author(name="Minecraft Server", icon_url=self.GRASS_ICON)
-        embed.set_thumbnail(url=self.GRASS_ICON)
         embed.timestamp = discord.utils.utcnow()
 
         if not cfg:
             embed.description = "Not configured yet. Use `/mc setup`."
-            return embed
+            embed.set_thumbnail(url=self.GRASS_ICON)
+            return embed, None
 
         ok, data = await mc_status(cfg.kind, cfg.host, cfg.port)
         show_port = effective_port(cfg.kind, cfg.port)
@@ -902,8 +1037,10 @@ class MinecraftCog(commands.Cog):
         else:
             display_addr = f"{cfg.host}:{show_port}"
 
+        embed.color = discord.Color.green() if ok else discord.Color.red()
+
         if ok:
-            embed.add_field(name="Status", value=f"**Online** `{display_addr}`", inline=False)
+            embed.description = f"🟢 **Online** — `{display_addr}`"
 
             if not simple:
                 motd = data.get("motd") or "—"
@@ -919,24 +1056,32 @@ class MinecraftCog(commands.Cog):
             if not sample:
                 sample = await rcon_player_names_if_available(cfg)
             if sample:
-                shown = ", ".join(sample[:20])
-                more = f" … (+{len(sample)-20} more)" if len(sample) > 20 else ""
+                shown = "\n".join(f"• {n}" for n in sample[:20])
+                more = f"\n… (+{len(sample)-20} more)" if len(sample) > 20 else ""
                 embed.add_field(name="Who’s Online", value=shown + more, inline=False)
-        else:
-            embed.add_field(
-                name="Status",
-                value=f"**Offline / Unreachable** `{display_addr}`\n```{data.get('error','unknown error')}```",
-                inline=False,
+
+            file = await render_status_banner(
+                online=True, host=display_addr, version=data.get("version"),
+                players=data.get("players_online"), max_players=data.get("players_max"),
             )
+        else:
+            embed.description = f"🔴 **Offline / Unreachable** — `{display_addr}`"
+            embed.add_field(name="Error", value=f"```{data.get('error','unknown error')}```", inline=False)
+            file = await render_status_banner(online=False, host=display_addr)
+
+        if file:
+            embed.set_image(url=f"attachment://{file.filename}")
+        else:
+            embed.set_thumbnail(url=self.GRASS_ICON)
 
         hints: List[str] = []
-        hints.append("RCON ready" if rcon_ready(cfg) else "RCON not set")
+        hints.append("🔧 RCON ready" if rcon_ready(cfg) else "🔧 RCON not set")
         if cfg.sticky_channel_id and cfg.sticky_interval_min:
-            hints.append(f"Sticky: every {cfg.sticky_interval_min}m")
+            hints.append(f"🔁 every {cfg.sticky_interval_min}m")
         if cfg.player_log_channel_id:
-            hints.append("Join/leave log: on")
+            hints.append("📋 join/leave log on")
         embed.set_footer(text=" • ".join(hints))
-        return embed
+        return embed, file
 
     async def _refresh_sticky_for_guild(self, gid: str) -> None:
         cfg = self.configs.get(gid)
@@ -954,7 +1099,7 @@ class MinecraftCog(commands.Cog):
             save_all_configs(self.configs)
             return
 
-        embed = await self.build_status_embed(guild.id, simple=True)
+        embed, file = await self.build_status_embed(guild.id, simple=True)
 
         msg = None
         if cfg.sticky_message_id:
@@ -965,13 +1110,15 @@ class MinecraftCog(commands.Cog):
 
         if msg:
             try:
-                await msg.edit(content="‎", embed=embed)  # zero-width char
+                # attachments=[] clears the old banner if this refresh has none (e.g. render failed);
+                # passing a fresh File each time is required since a File's buffer is single-use.
+                await msg.edit(content="‎", embed=embed, attachments=[file] if file else [])  # zero-width char
             except discord.HTTPException:
                 msg = None
 
         if not msg:
             try:
-                sent = await channel.send(embed=embed)
+                sent = await channel.send(embed=embed, file=file) if file else await channel.send(embed=embed)
                 cfg.sticky_message_id = sent.id
                 save_all_configs(self.configs)
             except discord.HTTPException:
@@ -1116,14 +1263,16 @@ class MinecraftCog(commands.Cog):
     @group.command(name="status", description="Show live status and open the RCON panel")
     async def status(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        embed = await self.build_status_embed(interaction.guild_id)
-        await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id))
+        embed, file = await self.build_status_embed(interaction.guild_id)
+        kwargs = {"file": file} if file else {}
+        await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id), **kwargs)
 
     @group.command(name="panel", description="Open the interactive RCON panel")
     async def panel(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        embed = await self.build_status_embed(interaction.guild_id)
-        await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id))
+        embed, file = await self.build_status_embed(interaction.guild_id)
+        kwargs = {"file": file} if file else {}
+        await interaction.followup.send(embed=embed, view=PanelView(self, interaction.guild_id), **kwargs)
 
     @group.command(name="config", description="Show the current Minecraft configuration for this server")
     async def show_config(self, interaction: discord.Interaction):
