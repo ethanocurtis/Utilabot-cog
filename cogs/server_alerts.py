@@ -72,11 +72,19 @@ def _send_email_sync(to_addr: str, body: str) -> None:
     msg["Subject"] = ""  # most carrier gateways just concatenate subject+body; keep it out of the way
     msg["From"] = SMTP_FROM
     msg["To"] = to_addr
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-        if SMTP_USE_TLS:
-            server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
+    if SMTP_PORT == 465:
+        # Implicit TLS: the server expects a TLS handshake immediately, not a
+        # plaintext EHLO first — speaking plain SMTP.starttls() here just
+        # hangs until it times out.
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
 
 
 async def send_sms(to_addr: str, body: str) -> Tuple[bool, str]:
