@@ -5,9 +5,12 @@
 # issue type from a dropdown (Server Down, Lag/TPS, Bug/Crash, Player issue,
 # Other), fills in a short details modal, and the cog posts an alert embed in
 # the configured alert channel, pinging a configured admin role and/or up to
-# a handful of specific admin users. Admins can Acknowledge / Resolve each
-# alert with buttons (or the /alerts ack /alerts resolve commands), and
-# reporters are rate-limited per-user to avoid spam.
+# a handful of specific admin users. It can also email a set of addresses on
+# every report (handy since most phones push-notify on new email — carrier
+# email-to-SMS gateways are being phased out, so this is the free fallback).
+# Admins can Acknowledge / Resolve each alert with buttons (or the
+# /alerts ack /alerts resolve commands), and reporters are rate-limited
+# per-user to avoid spam.
 #
 # JSON persistence per-guild (data/server_alerts.json) — no DB required.
 from __future__ import annotations
@@ -36,11 +39,16 @@ DATA_FILE = os.path.join(DATA_DIR, "server_alerts.json")
 DEFAULT_COOLDOWN_SECONDS = 300  # 5 minutes per reporter
 
 # =========================
-# SMS via email-to-SMS carrier gateways
+# Email alerts (SMTP)
 # =========================
-# Each configured number is stored as a full "digits@carrier-gateway" address
-# and texted by sending a plain email to it. Free, but delivery isn't
-# guaranteed and carriers may delay/filter it as spam.
+# Sends a plain email to each configured address on every report. This
+# replaced an earlier email-to-SMS-gateway approach — carriers (Verizon
+# included) have been shutting those gateways down, so there's no reliable
+# free way to send an actual text. A real email works everywhere and still
+# reaches a phone instantly via push notification if the recipient has mail
+# notifications on.
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or "587")
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
@@ -48,28 +56,14 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM") or SMTP_USERNAME
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").strip().lower() not in ("0", "false", "no")
 
-# name shown in Discord choices -> (display, email domain)
-CARRIER_GATEWAYS: Dict[str, Tuple[str, str]] = {
-    "att": ("AT&T", "txt.att.net"),
-    "verizon": ("Verizon", "vtext.com"),
-    "tmobile": ("T-Mobile", "tmomail.net"),
-    "sprint": ("Sprint", "messaging.sprintpcs.com"),
-    "boost": ("Boost Mobile", "sms.myboostmobile.com"),
-    "cricket": ("Cricket", "sms.cricketwireless.net"),
-    "uscellular": ("US Cellular", "email.uscc.net"),
-    "metropcs": ("Metro by T-Mobile", "mymetropcs.com"),
-    "googlefi": ("Google Fi", "msg.fi.google.com"),
-    "visible": ("Visible", "vtext.com"),
-}
 
-
-def sms_configured() -> bool:
+def email_configured() -> bool:
     return bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM)
 
 
-def _send_email_sync(to_addr: str, body: str) -> None:
+def _send_email_sync(to_addr: str, subject: str, body: str) -> None:
     msg = MIMEText(body)
-    msg["Subject"] = ""  # most carrier gateways just concatenate subject+body; keep it out of the way
+    msg["Subject"] = subject
     msg["From"] = SMTP_FROM
     msg["To"] = to_addr
     if SMTP_PORT == 465:
@@ -87,14 +81,14 @@ def _send_email_sync(to_addr: str, body: str) -> None:
             server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
 
 
-async def send_sms(to_addr: str, body: str) -> Tuple[bool, str]:
-    """Sends a text via an email-to-SMS gateway. Offloaded to a thread since
-    smtplib is blocking, mirroring how the Minecraft cog handles RCON I/O."""
-    if not sms_configured():
+async def send_email_alert(to_addr: str, subject: str, body: str) -> Tuple[bool, str]:
+    """Sends an alert email. Offloaded to a thread since smtplib is blocking,
+    mirroring how the Minecraft cog handles RCON I/O."""
+    if not email_configured():
         return False, "SMTP not configured (set SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD/SMTP_FROM)."
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, lambda: _send_email_sync(to_addr, body[:300]))
+        await loop.run_in_executor(None, lambda: _send_email_sync(to_addr, subject, body))
         return True, "sent"
     except Exception as e:
         return False, str(e)
@@ -136,7 +130,7 @@ class GuildConfig:
     panel_message_id: Optional[int] = None
     alert_role_id: Optional[int] = None
     admin_user_ids: List[int] = field(default_factory=list)
-    sms_numbers: List[Dict[str, str]] = field(default_factory=list)  # [{"label": str, "address": "digits@gateway"}]
+    alert_emails: List[Dict[str, str]] = field(default_factory=list)  # [{"label": str, "address": "you@example.com"}]
     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS
     next_report_no: int = 1
 
@@ -328,20 +322,21 @@ class ServerAlerts(commands.Cog):
         msg = await channel.send(content=content, embed=_report_embed(info), view=view, allowed_mentions=allowed)
         await self.store.update_report(key, alert_message_id=msg.id)
 
-        if cfg.sms_numbers:
-            asyncio.create_task(self._text_admins(cfg, info))
+        if cfg.alert_emails:
+            asyncio.create_task(self._email_admins(cfg, info))
 
         return key
 
-    async def _text_admins(self, cfg: GuildConfig, info: Dict[str, Any]) -> None:
-        """Best-effort: texts every configured number, logging failures without
-        touching the report — a bad number or SMTP outage shouldn't block reports."""
+    async def _email_admins(self, cfg: GuildConfig, info: Dict[str, Any]) -> None:
+        """Best-effort: emails every configured address, logging failures without
+        touching the report — a bad address or SMTP outage shouldn't block reports."""
         label = ISSUE_LABELS.get(info["issue_type"], info["issue_type"])
-        body = f"MC Alert #{info['number']:04d} {label}\n{info.get('details') or ''}".strip()
-        for entry in cfg.sms_numbers:
-            ok, err = await send_sms(entry["address"], body)
+        subject = f"MC Alert #{info['number']:04d} — {label}"
+        body = f"{label}\n\n{info.get('details') or ''}\n\nReported at {info.get('created_at', 'unknown')}"
+        for entry in cfg.alert_emails:
+            ok, err = await send_email_alert(entry["address"], subject, body)
             if not ok:
-                log.warning("SMS to %s (%s) failed: %s", entry.get("label"), entry.get("address"), err)
+                log.warning("Alert email to %s (%s) failed: %s", entry.get("label"), entry.get("address"), err)
 
     # ---------- admin setup ----------
     alerts = app_commands.Group(name="alerts", description="Configure and manage server issue reports.", guild_only=True)
@@ -394,7 +389,7 @@ class ServerAlerts(commands.Cog):
             f"✅ Panel posted in {panel_channel.mention}.\n"
             f"Alerts will be posted in {alert_channel.mention}.\n"
             f"Pinged on report: {ping_summary}\n"
-            f"-# Want texts too? Use `/alerts sms add` to text specific numbers on every report.",
+            f"-# Want email alerts too? Use `/alerts email add` to email specific addresses on every report.",
             ephemeral=True,
         )
 
@@ -458,73 +453,63 @@ class ServerAlerts(commands.Cog):
         await self.store.set_guild_config(cfg)
         await interaction.response.send_message(f"✅ Report cooldown set to **{seconds}s**.", ephemeral=True)
 
-    # ---------- SMS (email-to-SMS gateway) ----------
-    sms = app_commands.Group(name="sms", description="Text specific phone numbers on every issue report.", parent=alerts)
+    # ---------- Email alerts ----------
+    email = app_commands.Group(name="email", description="Email specific addresses on every issue report.", parent=alerts)
 
-    @sms.command(name="add", description="(Admin) Text a phone number on every issue report.")
+    @email.command(name="add", description="(Admin) Email an address on every issue report.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
-        label="A short name for this number (e.g. 'Ethan') — reusing a label replaces it",
-        phone_number="10-digit US phone number, digits only (e.g. 5551234567)",
-        carrier="The number's carrier, used to build the email-to-SMS address",
+        label="A short name for this address (e.g. 'Ethan') — reusing a label replaces it",
+        address="Email address to notify (any provider — use one with mobile push notifications for phone alerts)",
     )
-    @app_commands.choices(carrier=[
-        app_commands.Choice(name=display, value=key) for key, (display, _domain) in CARRIER_GATEWAYS.items()
-    ])
-    async def sms_add(
-        self, interaction: discord.Interaction, label: str, phone_number: str, carrier: app_commands.Choice[str]
-    ):
-        digits = re.sub(r"\D", "", phone_number)
-        if len(digits) != 10:
-            return await interaction.response.send_message(
-                "⚠️ Enter a 10-digit US phone number, digits only (e.g. `5551234567`).", ephemeral=True
-            )
-        domain = CARRIER_GATEWAYS[carrier.value][1]
-        address = f"{digits}@{domain}"
+    async def email_add(self, interaction: discord.Interaction, label: str, address: str):
+        address = address.strip()
+        if not EMAIL_RE.match(address):
+            return await interaction.response.send_message("⚠️ That doesn't look like a valid email address.", ephemeral=True)
         cfg = await self.store.get_guild_config(interaction.guild_id)
-        cfg.sms_numbers = [n for n in cfg.sms_numbers if n["label"].lower() != label.lower()]
-        cfg.sms_numbers.append({"label": label, "address": address})
+        cfg.alert_emails = [n for n in cfg.alert_emails if n["label"].lower() != label.lower()]
+        cfg.alert_emails.append({"label": label, "address": address})
         await self.store.set_guild_config(cfg)
 
-        msg = f"✅ **{label}** ({digits}, {carrier.name}) will be texted on every report."
-        if not sms_configured():
+        msg = f"✅ **{label}** (`{address}`) will be emailed on every report."
+        if not email_configured():
             msg += (
                 "\n⚠️ Heads up: SMTP isn't configured on the bot yet "
-                "(`SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_FROM`), so texts won't send until it is."
+                "(`SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_FROM`), so emails won't send until it is."
             )
         await interaction.response.send_message(msg, ephemeral=True)
 
-    @sms.command(name="remove", description="(Admin) Stop texting a phone number on issue reports.")
+    @email.command(name="remove", description="(Admin) Stop emailing an address on issue reports.")
     @app_commands.default_permissions(manage_guild=True)
-    async def sms_remove(self, interaction: discord.Interaction, label: str):
+    async def email_remove(self, interaction: discord.Interaction, label: str):
         cfg = await self.store.get_guild_config(interaction.guild_id)
-        before = len(cfg.sms_numbers)
-        cfg.sms_numbers = [n for n in cfg.sms_numbers if n["label"].lower() != label.lower()]
-        if len(cfg.sms_numbers) == before:
-            return await interaction.response.send_message(f"No number labeled **{label}** found.", ephemeral=True)
+        before = len(cfg.alert_emails)
+        cfg.alert_emails = [n for n in cfg.alert_emails if n["label"].lower() != label.lower()]
+        if len(cfg.alert_emails) == before:
+            return await interaction.response.send_message(f"No address labeled **{label}** found.", ephemeral=True)
         await self.store.set_guild_config(cfg)
         await interaction.response.send_message(f"✅ Removed **{label}**.", ephemeral=True)
 
-    @sms.command(name="list", description="(Admin) List phone numbers texted on issue reports.")
+    @email.command(name="list", description="(Admin) List email addresses notified on issue reports.")
     @app_commands.default_permissions(manage_guild=True)
-    async def sms_list(self, interaction: discord.Interaction):
+    async def email_list(self, interaction: discord.Interaction):
         cfg = await self.store.get_guild_config(interaction.guild_id)
-        if not cfg.sms_numbers:
-            return await interaction.response.send_message("No SMS numbers configured.", ephemeral=True)
-        lines = [f"• **{n['label']}** — `{n['address']}`" for n in cfg.sms_numbers]
-        status = "🟢 SMTP configured" if sms_configured() else "🔴 SMTP not configured — texts won't send"
+        if not cfg.alert_emails:
+            return await interaction.response.send_message("No alert emails configured.", ephemeral=True)
+        lines = [f"• **{n['label']}** — `{n['address']}`" for n in cfg.alert_emails]
+        status = "🟢 SMTP configured" if email_configured() else "🔴 SMTP not configured — emails won't send"
         await interaction.response.send_message(f"{status}\n" + "\n".join(lines), ephemeral=True)
 
-    @sms.command(name="test", description="(Admin) Send a test text to all configured numbers.")
+    @email.command(name="test", description="(Admin) Send a test email to all configured addresses.")
     @app_commands.default_permissions(manage_guild=True)
-    async def sms_test(self, interaction: discord.Interaction):
+    async def email_test(self, interaction: discord.Interaction):
         cfg = await self.store.get_guild_config(interaction.guild_id)
-        if not cfg.sms_numbers:
-            return await interaction.response.send_message("No SMS numbers configured.", ephemeral=True)
+        if not cfg.alert_emails:
+            return await interaction.response.send_message("No alert emails configured.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         results = []
-        for entry in cfg.sms_numbers:
-            ok, err = await send_sms(entry["address"], "MC Alert test text — this is only a test.")
+        for entry in cfg.alert_emails:
+            ok, err = await send_email_alert(entry["address"], "MC Alert test", "This is only a test.")
             results.append(f"{'✅' if ok else '❌'} **{entry['label']}**" + ("" if ok else f" — `{err}`"))
         await interaction.followup.send("\n".join(results), ephemeral=True)
 
