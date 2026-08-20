@@ -168,9 +168,10 @@ class AlertStore:
                 self.data["guilds"][str(guild_id)] = asdict(cfg)
                 self._save()
                 return cfg
-            # Tolerate old configs missing newer fields.
+            # Tolerate old configs missing newer fields (or carrying fields a
+            # later rename removed, e.g. the old sms_numbers -> alert_emails).
             defaults = asdict(GuildConfig(guild_id=guild_id))
-            defaults.update(g)
+            defaults.update({k: v for k, v in g.items() if k in defaults})
             return GuildConfig(**defaults)
 
     async def set_guild_config(self, cfg: GuildConfig):
