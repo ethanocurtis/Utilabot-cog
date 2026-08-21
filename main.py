@@ -12,6 +12,7 @@ intents.members = True
 intents.guilds = True
 
 COGS = [
+    "cogs.help",
     "cogs.weather",
     "cogs.economy",
     "cogs.business",
