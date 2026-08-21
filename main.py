@@ -34,6 +34,7 @@ COGS = [
     "cogs.mc_todo",
     "cogs.stickynotes",
     "cogs.server_alerts",
+    "cogs.auto_role",
 ]
 
 class UtilaBot(commands.Bot):
