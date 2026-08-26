@@ -9,8 +9,9 @@
 # every report (handy since most phones push-notify on new email — carrier
 # email-to-SMS gateways are being phased out, so this is the free fallback).
 # Admins can Acknowledge / Resolve each alert with buttons (or the
-# /alerts ack /alerts resolve commands), and reporters are rate-limited
-# per-user to avoid spam.
+# /alerts ack /alerts resolve commands), which best-effort DMs the original
+# reporter so they know their report was seen/fixed. Reporters are
+# rate-limited per-user to avoid spam.
 #
 # JSON persistence per-guild (data/server_alerts.json) — no DB required.
 from __future__ import annotations
@@ -552,8 +553,21 @@ class ServerAlerts(commands.Cog):
         if not info:
             return await interaction.response.send_message("Report not found.", ephemeral=True)
         await self._sync_alert_message(info)
+        if info["reporter_id"] != interaction.user.id:
+            await self._notify_reporter(
+                info, f"✅ Your issue report **#{info['number']:04d}** was marked **resolved** by {interaction.user.mention}."
+            )
         if not interaction.response.is_done():
             await interaction.response.send_message(f"✅ Report #{info['number']:04d} marked resolved.", ephemeral=True)
+
+    async def _notify_reporter(self, info: Dict[str, Any], message: str) -> None:
+        """Best-effort DM to the reporter — silently skipped if their DMs are
+        closed, they've left the server, or anything else goes wrong."""
+        try:
+            user = self.bot.get_user(info["reporter_id"]) or await self.bot.fetch_user(info["reporter_id"])
+            await user.send(message)
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            pass
 
     async def _sync_alert_message(self, info: Dict[str, Any]):
         guild = self.bot.get_guild(info["guild_id"])
@@ -683,6 +697,10 @@ class AlertActionView(discord.ui.View):
         if info.get("status") == "open":
             info = await self.cog.store.update_report(self.report_key, status="acknowledged")
         await self.cog._sync_alert_message(info)
+        if info["reporter_id"] != interaction.user.id:
+            await self.cog._notify_reporter(
+                info, f"👀 Your issue report **#{info['number']:04d}** was acknowledged by {interaction.user.mention} — an admin is looking into it."
+            )
         await interaction.response.send_message(f"👀 Marked #{info['number']:04d} acknowledged.", ephemeral=True)
 
     async def _resolve(self, interaction: discord.Interaction):
