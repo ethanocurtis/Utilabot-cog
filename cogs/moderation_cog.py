@@ -28,7 +28,13 @@ class Moderation(commands.Cog):
           strategies:
             - auto (bulk recent, slow older with pacing)
             - safe (all slow with pacing)
-            - nuke (recreate channel, delete old)  <-- fastest/quietest
+            - nuke (recreate channel, delete old)  <-- fastest/quietest;
+              loses pins/threads/webhooks tied to the old channel ID (warned
+              about in the strategy's choice description and the result message)
+          Only one purge/purge_all run is allowed per channel at a time.
+          Long "auto"/"safe" runs post periodic progress and fall back to a
+          plain channel message once the interaction token is likely expired
+          (~14 minutes in), so results are never silently lost.
       - /autodelete set|disable|status|list
       - runtime deletion (per-message if <60s, periodic sweep for >=60s)
 
@@ -36,14 +42,51 @@ class Moderation(commands.Cog):
       - Store with set_autodelete/remove_autodelete/get_autodelete()
       - WxStore with set_config/delete_config/get_config/get_config_all()
     """
+    # Discord interaction (webhook) tokens expire ~15 minutes after the
+    # interaction was created; edits to the deferred reply stop working past
+    # that point. Keep a safety margin so long purges still report in.
+    _TOKEN_SAFETY_WINDOW = timedelta(minutes=14)
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.store = getattr(bot, "store", None)
+        self._active_purges: set = set()
         if not getattr(self, "_sweeper_started", False):
             self.cleanup_loop.start()
             self._sweeper_started = True
 
     # ---------- helpers ----------
+    def _try_start_purge(self, channel_id: int) -> bool:
+        """Guards against overlapping purge/purge_all runs on the same channel
+        (both to avoid double-deleting the same messages and to avoid a 429
+        storm from two loops hammering the same channel at once)."""
+        if channel_id in self._active_purges:
+            return False
+        self._active_purges.add(channel_id)
+        return True
+
+    def _end_purge(self, channel_id: int) -> None:
+        self._active_purges.discard(channel_id)
+
+    async def _purge_report(self, inter: discord.Interaction, start_time: datetime, text: str) -> None:
+        """
+        Best-effort progress/result report for long-running purges. While
+        we're still within the token safety window we edit the deferred
+        (ephemeral) reply; once we're past it -- or the edit itself fails,
+        e.g. because the token already expired -- fall back to a plain
+        message in the channel so long purges still report a result.
+        """
+        if datetime.now(timezone.utc) - start_time < self._TOKEN_SAFETY_WINDOW:
+            try:
+                await inter.edit_original_response(content=text)
+                return
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        try:
+            await inter.channel.send(text)
+        except Exception:
+            pass
+
     def _is_admin_or_allowlisted(self, inter: discord.Interaction) -> bool:
         if _has_guild_admin_perms(inter):
             return True
@@ -144,6 +187,11 @@ class Moderation(commands.Cog):
                 return False
             return (user is None) or (m.author.id == user.id)
 
+        if not self._try_start_purge(inter.channel.id):
+            return await inter.response.send_message(
+                "⚠️ A purge is already running in this channel. Please wait for it to finish.", ephemeral=True
+            )
+
         await inter.response.defer(ephemeral=True)
         try:
             deleted = await inter.channel.purge(limit=limit, check=check, bulk=True)
@@ -154,6 +202,8 @@ class Moderation(commands.Cog):
             )
         except discord.HTTPException as e:
             await inter.followup.send(f"Error while deleting: {e}", ephemeral=True)
+        finally:
+            self._end_purge(inter.channel.id)
 
     # ---------- /purge_all (all history, any age) ----------
     @app_commands.command(
@@ -162,7 +212,7 @@ class Moderation(commands.Cog):
     )
     @app_commands.describe(
         confirm="Must be true to proceed (safety check).",
-        strategy="auto (default), safe, or nuke",
+        strategy="auto (default), safe, or nuke -- nuke loses pins/threads/webhooks, see choice description",
         user="Optional: only delete messages by this user",
         pace_seconds="For slow deletes: delay between deletes (default 1.5s; increase to reduce 429s)."
     )
@@ -170,7 +220,7 @@ class Moderation(commands.Cog):
         strategy=[
             app_commands.Choice(name="auto (bulk recent + slow older)", value="auto"),
             app_commands.Choice(name="safe (all slow, minimal burst)", value="safe"),
-            app_commands.Choice(name="nuke (recreate channel; fastest)", value="nuke"),
+            app_commands.Choice(name="nuke (recreate channel, fastest; ⚠️ loses pins/threads/webhooks)", value="nuke"),
         ]
     )
     @gated()
@@ -210,96 +260,152 @@ class Moderation(commands.Cog):
         except Exception:
             pass
 
-        await inter.response.defer(ephemeral=True, thinking=True)
+        if not self._try_start_purge(inter.channel.id):
+            return await inter.response.send_message(
+                "⚠️ A purge is already running in this channel. Please wait for it to finish.", ephemeral=True
+            )
 
-        if strat == "nuke":
-            try:
-                deleted_total = await self._nuke_channel(inter)
-                return await inter.followup.send(
-                    f"💣 Channel recreated. Old channel deleted. ({deleted_total} message history removed)", ephemeral=True
+        try:
+            await inter.response.defer(ephemeral=True, thinking=True)
+            start_time = datetime.now(timezone.utc)
+
+            if strat == "nuke":
+                try:
+                    _, lost_pins, lost_threads, lost_webhooks = await self._nuke_channel(inter)
+                    lost_bits = []
+                    if lost_pins:
+                        lost_bits.append(f"{lost_pins} pinned message{'s' if lost_pins != 1 else ''}")
+                    if lost_threads:
+                        lost_bits.append(f"{lost_threads} active thread{'s' if lost_threads != 1 else ''}")
+                    if lost_webhooks:
+                        lost_bits.append(f"{lost_webhooks} webhook{'s' if lost_webhooks != 1 else ''}")
+                    warn = f" ⚠️ Not carried over: {', '.join(lost_bits)}." if lost_bits else ""
+                    return await inter.followup.send(
+                        f"💣 Channel recreated. Old channel and its full history are gone.{warn}", ephemeral=True
+                    )
+                except Exception as e:
+                    return await inter.followup.send(
+                        f"❌ Nuke failed: {e}. Try `strategy: auto` instead.", ephemeral=True
+                    )
+
+            # Deletion filters & helpers
+            cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+
+            def check(m: discord.Message):
+                if getattr(m, "pinned", False):
+                    return False
+                if user is not None and m.author.id != user.id:
+                    return False
+                return True
+
+            total_deleted = 0
+            last_report = start_time
+
+            async def maybe_report(note: str = ""):
+                nonlocal last_report
+                now = datetime.now(timezone.utc)
+                if now - last_report >= timedelta(seconds=5):
+                    last_report = now
+                    await self._purge_report(
+                        inter, start_time, f"🧨 Purging{note}… deleted **{total_deleted}** so far."
+                    )
+
+            # SAFE: only slow path with pacing
+            if strat == "safe":
+                try:
+                    async for m in inter.channel.history(limit=None, oldest_first=False):
+                        if not check(m):
+                            continue
+                        try:
+                            await m.delete()
+                            total_deleted += 1
+                        except discord.HTTPException:
+                            # extra backoff if we tripped a rate-limit edge
+                            await asyncio.sleep(pace * 2)
+                            continue
+                        await asyncio.sleep(pace)
+                        await maybe_report(" (safe)")
+                except Exception as e:
+                    return await self._purge_report(
+                        inter, start_time, f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**."
+                    )
+                return await self._purge_report(
+                    inter, start_time, f"🧨 Purge complete (safe). Deleted **{total_deleted}** messages."
                 )
-            except Exception as e:
-                return await inter.followup.send(
-                    f"❌ Nuke failed: {e}. Try `strategy: auto` instead.", ephemeral=True
-                )
 
-        # Deletion filters & helpers
-        cutoff = datetime.now(timezone.utc) - timedelta(days=14)
-
-        def check(m: discord.Message):
-            if getattr(m, "pinned", False):
-                return False
-            if user is not None and m.author.id != user.id:
-                return False
-            return True
-
-        total_deleted = 0
-
-        # SAFE: only slow path with pacing
-        if strat == "safe":
+            # AUTO: bulk for recent, slow for older
+            # 1) FAST PATH: bulk purge everything newer than 14 days
             try:
-                async for m in inter.channel.history(limit=None, oldest_first=False):
+                while True:
+                    batch = await inter.channel.purge(
+                        limit=1000,
+                        check=check,
+                        after=cutoff,
+                        bulk=True
+                    )
+                    total_deleted += len(batch)
+                    await maybe_report(" (auto, bulk)")
+                    if len(batch) < 1000:
+                        break
+                    await asyncio.sleep(0.8)  # small pause between bulk rounds
+            except Exception:
+                pass  # fall through to slow path regardless
+
+            # 2) SLOW PATH: delete everything older than 14d, one-by-one with pacing + backoff
+            try:
+                async for m in inter.channel.history(limit=None, oldest_first=False, before=cutoff):
                     if not check(m):
                         continue
                     try:
                         await m.delete()
                         total_deleted += 1
                     except discord.HTTPException:
-                        # extra backoff if we tripped a rate-limit edge
-                        await asyncio.sleep(pace * 2)
+                        # If we hit a 429 edge, give a longer breather
+                        await asyncio.sleep(pace * 2.5)
                         continue
                     await asyncio.sleep(pace)
+                    await maybe_report(" (auto, older messages)")
             except Exception as e:
-                return await inter.followup.send(
-                    f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**.", ephemeral=True
+                return await self._purge_report(
+                    inter, start_time, f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**."
                 )
-            return await inter.followup.send(f"🧨 Purge complete (safe). Deleted **{total_deleted}** messages.", ephemeral=True)
 
-        # AUTO: bulk for recent, slow for older
-        # 1) FAST PATH: bulk purge everything newer than 14 days
-        try:
-            while True:
-                batch = await inter.channel.purge(
-                    limit=1000,
-                    check=check,
-                    after=cutoff,
-                    bulk=True
-                )
-                total_deleted += len(batch)
-                if len(batch) < 1000:
-                    break
-                await asyncio.sleep(0.8)  # small pause between bulk rounds
-        except Exception:
-            pass  # fall through to slow path regardless
+            await self._purge_report(inter, start_time, f"🧨 Purge complete. Deleted **{total_deleted}** messages.")
+        finally:
+            self._end_purge(inter.channel.id)
 
-        # 2) SLOW PATH: delete everything older than 14d, one-by-one with pacing + backoff
-        try:
-            async for m in inter.channel.history(limit=None, oldest_first=False, before=cutoff):
-                if not check(m):
-                    continue
-                try:
-                    await m.delete()
-                    total_deleted += 1
-                except discord.HTTPException:
-                    # If we hit a 429 edge, give a longer breather
-                    await asyncio.sleep(pace * 2.5)
-                    continue
-                await asyncio.sleep(pace)
-        except Exception as e:
-            return await inter.followup.send(
-                f"Stopped early due to an error: {e}\nDeleted so far: **{total_deleted}**.", ephemeral=True
-            )
-
-        await inter.followup.send(f"🧨 Purge complete. Deleted **{total_deleted}** messages.", ephemeral=True)
-
-    async def _nuke_channel(self, inter: discord.Interaction) -> int:
+    async def _nuke_channel(self, inter: discord.Interaction) -> Tuple[int, int, int, int]:
         """
         Recreate the current text channel with the same settings, move it into place,
-        archive + delete the old one. Returns a best-effort count of messages removed (if known).
+        archive + delete the old one.
+
+        Nuking recreates the channel under a new ID, so anything keyed to the old
+        channel does NOT carry over: pinned messages, active threads, and webhooks
+        pointing at it are all lost even though permissions/topic/slowmode are
+        copied onto the replacement. We snapshot best-effort counts of those
+        before deleting so the caller can warn the user what's gone.
+
+        Returns (deleted_message_count, lost_pins, lost_threads, lost_webhooks).
+        deleted_message_count is always -1 (unknown without iterating history).
         """
         ch = inter.channel
         assert isinstance(ch, discord.TextChannel)
         guild = ch.guild
+
+        # Best-effort snapshot of what nuke can't carry over, for the caller's report.
+        lost_pins = lost_threads = lost_webhooks = 0
+        try:
+            lost_pins = len(await ch.pins())
+        except Exception:
+            pass
+        try:
+            lost_threads = sum(1 for t in guild.threads if t.parent_id == ch.id)
+        except Exception:
+            pass
+        try:
+            lost_webhooks = len(await ch.webhooks())
+        except Exception:
+            pass
 
         # Snapshot channel props
         name = ch.name
@@ -337,8 +443,8 @@ class Moderation(commands.Cog):
         # Delete the old channel (one API call, removes entire history)
         await ch.delete()
 
-        # Done. (We can’t know message count without iterating; return -1 as sentinel)
-        return -1
+        # Done. (We can't know message count without iterating; return -1 as sentinel)
+        return -1, lost_pins, lost_threads, lost_webhooks
 
     # ---------- /autodelete set|disable|status|list ----------
     @app_commands.command(name="autodelete", description="Manage auto-delete for this channel (set/disable/status/list).")

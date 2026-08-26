@@ -12,6 +12,7 @@ intents.members = True
 intents.guilds = True
 
 COGS = [
+    "cogs.help",
     "cogs.weather",
     "cogs.economy",
     "cogs.business",
@@ -34,6 +35,7 @@ COGS = [
     "cogs.mc_todo",
     "cogs.stickynotes",
     "cogs.server_alerts",
+    "cogs.auto_role",
 ]
 
 class UtilaBot(commands.Bot):
