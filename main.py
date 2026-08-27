@@ -36,6 +36,7 @@ COGS = [
     "cogs.stickynotes",
     "cogs.server_alerts",
     "cogs.auto_role",
+    "cogs.pterodactyl",
 ]
 
 class UtilaBot(commands.Bot):
