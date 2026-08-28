@@ -229,12 +229,19 @@ def _report_embed(info: Dict[str, Any]) -> discord.Embed:
         color=STATUS_COLOR.get(status, discord.Color.red()),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Reported by", value=f"<@{info['reporter_id']}>", inline=True)
+    # Mentions placed inside embed fields don't resolve to a name and aren't
+    # clickable the way mentions in plain message content are — some clients
+    # just show the raw digits. Show the captured display name as the primary
+    # text, with the mention tacked on as a bonus where a client does resolve it.
+    reporter_name = info.get("reporter_name") or "Unknown"
+    embed.add_field(name="Reported by", value=f"{reporter_name} (<@{info['reporter_id']}>)", inline=True)
     embed.add_field(name="Status", value=STATUS_LABEL.get(status, status), inline=True)
     if info.get("acknowledged_by"):
-        embed.add_field(name="Acknowledged by", value=f"<@{info['acknowledged_by']}>", inline=True)
+        ack_name = info.get("acknowledged_by_name") or "Unknown"
+        embed.add_field(name="Acknowledged by", value=f"{ack_name} (<@{info['acknowledged_by']}>)", inline=True)
     if info.get("resolved_by"):
-        embed.add_field(name="Resolved by", value=f"<@{info['resolved_by']}>", inline=True)
+        resolved_name = info.get("resolved_by_name") or "Unknown"
+        embed.add_field(name="Resolved by", value=f"{resolved_name} (<@{info['resolved_by']}>)", inline=True)
     embed.set_footer(text=f"Reported at {info.get('created_at', 'unknown')}")
     return embed
 
@@ -300,6 +307,7 @@ class ServerAlerts(commands.Cog):
             "guild_id": interaction.guild_id,
             "number": number,
             "reporter_id": interaction.user.id,
+            "reporter_name": str(interaction.user),
             "issue_type": issue_type,
             "details": details,
             "status": "open",
@@ -307,7 +315,9 @@ class ServerAlerts(commands.Cog):
             "alert_channel_id": channel.id,
             "alert_message_id": None,
             "acknowledged_by": None,
+            "acknowledged_by_name": None,
             "resolved_by": None,
+            "resolved_by_name": None,
             "resolved_at": None,
         }
         key = await self.store.create_report(info)
@@ -526,7 +536,7 @@ class ServerAlerts(commands.Cog):
         for r in reports[:20]:
             lines.append(
                 f"**#{r['number']:04d}** {STATUS_LABEL.get(r['status'], r['status'])} — "
-                f"{ISSUE_LABELS.get(r['issue_type'], r['issue_type'])} — <@{r['reporter_id']}>"
+                f"{ISSUE_LABELS.get(r['issue_type'], r['issue_type'])} — {r.get('reporter_name') or 'Unknown'}"
             )
         embed = discord.Embed(title="Open Issue Reports", description="\n".join(lines), color=discord.Color.orange())
         if len(reports) > 20:
@@ -548,7 +558,11 @@ class ServerAlerts(commands.Cog):
 
     async def _resolve_report(self, interaction: discord.Interaction, key: str):
         info = await self.store.update_report(
-            key, status="resolved", resolved_by=interaction.user.id, resolved_at=_utc_now_str()
+            key,
+            status="resolved",
+            resolved_by=interaction.user.id,
+            resolved_by_name=str(interaction.user),
+            resolved_at=_utc_now_str(),
         )
         if not info:
             return await interaction.response.send_message("Report not found.", ephemeral=True)
@@ -691,7 +705,9 @@ class AlertActionView(discord.ui.View):
     async def _acknowledge(self, interaction: discord.Interaction):
         if await self._guard(interaction) is None:
             return
-        info = await self.cog.store.update_report(self.report_key, acknowledged_by=interaction.user.id)
+        info = await self.cog.store.update_report(
+            self.report_key, acknowledged_by=interaction.user.id, acknowledged_by_name=str(interaction.user)
+        )
         if not info:
             return await interaction.response.send_message("Report not found.", ephemeral=True)
         if info.get("status") == "open":
