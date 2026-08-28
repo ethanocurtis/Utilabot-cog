@@ -47,6 +47,7 @@ CATEGORY_META: Dict[str, Dict[str, str]] = {
     "MinecraftCog":  {"emoji": "⛏️", "label": "Minecraft",      "blurb": "RCON control panel for a Minecraft server."},
     "MCTodo":        {"emoji": "✅", "label": "Minecraft To-Do", "blurb": "Shared to-do list for a Minecraft server."},
     "ServerAlerts":  {"emoji": "🚨", "label": "Server Alerts",  "blurb": "Report and route Minecraft server issues."},
+    "PterodactylCog": {"emoji": "🦖", "label": "Pterodactyl",  "blurb": "Control panel + backup/crash monitoring for Pterodactyl servers."},
 }
 
 DEFAULT_EMOJI = "📦"
