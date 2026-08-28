@@ -239,6 +239,8 @@ class ServerConfig:
     name: str
     panel_channel_id: Optional[int] = None
     panel_message_id: Optional[int] = None
+    basic_panel_channel_id: Optional[int] = None
+    basic_panel_message_id: Optional[int] = None
     last_state: Optional[str] = None
     state_since: float = 0.0
     pending_signal: Optional[str] = None
@@ -255,6 +257,7 @@ class GuildConfig:
     panel_url: Optional[str] = None
     api_key: Optional[str] = None  # encrypted at rest when PTERO_SECRET_KEY is set
     alert_channel_id: Optional[int] = None
+    basic_role_id: Optional[int] = None  # role allowed to use the Start-only basic panel
     monitor_enabled: bool = True
     poll_interval_seconds: int = DEFAULT_POLL_SECONDS
     restart_timeout_seconds: int = DEFAULT_RESTART_TIMEOUT
@@ -321,7 +324,12 @@ class PteroStore:
 # =========================
 # Embeds
 # =========================
-def _panel_embed(sc: ServerConfig, resources: Optional[Dict[str, Any]], error: Optional[str] = None) -> discord.Embed:
+def _panel_embed(
+    sc: ServerConfig,
+    resources: Optional[Dict[str, Any]],
+    error: Optional[str] = None,
+    commands_line: str = "▶️ Start · 🔁 Restart · ⏹️ Stop · 🔄 Refresh — admins only",
+) -> discord.Embed:
     state = (resources or {}).get("current_state") if resources else None
     color = STATE_COLOR.get(state, discord.Color.greyple())
     emoji = STATE_EMOJI.get(state, "⚪")
@@ -344,12 +352,27 @@ def _panel_embed(sc: ServerConfig, resources: Optional[Dict[str, Any]], error: O
             embed.add_field(name="Uptime", value=_format_duration(uptime_ms / 1000), inline=True)
     if sc.pending_signal:
         embed.add_field(name="Pending", value=f"`{sc.pending_signal}` sent, waiting for confirmation…", inline=False)
-    embed.add_field(
-        name="Commands",
-        value="▶️ Start · 🔁 Restart · ⏹️ Stop · 🔄 Refresh — admins only",
-        inline=False,
-    )
+    embed.add_field(name="Commands", value=commands_line, inline=False)
     embed.set_footer(text=f"Identifier: {sc.identifier}")
+    return embed
+
+
+def _basic_panel_embed(sc: ServerConfig, resources: Optional[Dict[str, Any]], error: Optional[str] = None) -> discord.Embed:
+    """Stripped-down panel for non-admins: status + a single Start button, no
+    CPU/memory/disk clutter — just enough to see it's down and bring it back."""
+    embed = _panel_embed(
+        sc,
+        resources,
+        error=error,
+        commands_line="▶️ Start Server — press if it didn't come back up on its own",
+    )
+    # Drop the resource-usage fields (CPU/Memory/Disk/Uptime); keep status, any
+    # error, "Pending", and the Commands line.
+    for name in ("CPU", "Memory", "Disk", "Uptime"):
+        for i, f in enumerate(embed.fields):
+            if f.name == name:
+                embed.remove_field(i)
+                break
     return embed
 
 
@@ -432,6 +455,37 @@ class PteroControlView(discord.ui.View):
 
 
 # =========================
+# Persistent basic panel view (Start only — for the "not available to fix it
+# myself" case; anyone holding the configured basic_role_id can use it)
+# =========================
+class PteroBasicPanelView(discord.ui.View):
+    def __init__(self, cog: "PterodactylCog", guild_id: int, server_key: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.server_key = server_key
+        self.start_btn.custom_id = f"ptero:basicstart:{guild_id}:{server_key}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return False
+        if member.guild_permissions.administrator:
+            return True
+        cfg = await self.cog.store.get_guild_config(self.guild_id)
+        if cfg.basic_role_id and any(r.id == cfg.basic_role_id for r in member.roles):
+            return True
+        await interaction.response.send_message(
+            "🔒 You don't have the role for this. Ask an admin to grant it.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="Start Server", style=discord.ButtonStyle.success, emoji="▶️")
+    async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_power(interaction, self.guild_id, self.server_key, "start")
+
+
+# =========================
 # The Cog
 # =========================
 class PterodactylCog(commands.Cog):
@@ -451,6 +505,13 @@ class PterodactylCog(commands.Cog):
                         self.bot.add_view(PteroControlView(self, cfg.guild_id, key), message_id=int(sc.panel_message_id))
                     except Exception:
                         log.exception("Failed to re-register panel view for %s/%s", cfg.guild_id, key)
+                if sc.basic_panel_message_id:
+                    try:
+                        self.bot.add_view(
+                            PteroBasicPanelView(self, cfg.guild_id, key), message_id=int(sc.basic_panel_message_id)
+                        )
+                    except Exception:
+                        log.exception("Failed to re-register basic panel view for %s/%s", cfg.guild_id, key)
         self._monitor.start()
 
     def cog_unload(self):
@@ -497,6 +558,18 @@ class PterodactylCog(commands.Cog):
         except discord.HTTPException:
             log.exception("Failed to send Pterodactyl alert to channel %s", cfg.alert_channel_id)
 
+    async def _edit_message(self, channel_id: Optional[int], message_id: Optional[int], embed: discord.Embed):
+        if not channel_id or not message_id:
+            return
+        channel = self.bot.get_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+
     async def _refresh_panel_message(
         self,
         cfg: GuildConfig,
@@ -505,12 +578,13 @@ class PterodactylCog(commands.Cog):
         resources: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ):
-        """Redraws a server's posted panel embed. Pass `resources` (already
-        fetched by a caller, e.g. the monitor loop) to skip a duplicate API call."""
-        if not sc.panel_channel_id or not sc.panel_message_id:
-            return
-        channel = self.bot.get_channel(sc.panel_channel_id)
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        """Redraws a server's posted panel embed(s) — both the admin control
+        panel and the basic Start-only panel, when either is posted. Pass
+        `resources` (already fetched by a caller, e.g. the monitor loop) to
+        skip a duplicate API call."""
+        has_admin_panel = sc.panel_channel_id and sc.panel_message_id
+        has_basic_panel = sc.basic_panel_channel_id and sc.basic_panel_message_id
+        if not has_admin_panel and not has_basic_panel:
             return
         if resources is None and error is None:
             client = client or self._client_for(cfg)
@@ -520,11 +594,12 @@ class PterodactylCog(commands.Cog):
                 resources = await client.get_resources(sc.identifier)
             except PteroAPIError as e:
                 error = str(e)
-        try:
-            message = await channel.fetch_message(sc.panel_message_id)
-            await message.edit(embed=_panel_embed(sc, resources, error=error))
-        except discord.HTTPException:
-            pass
+        if has_admin_panel:
+            await self._edit_message(sc.panel_channel_id, sc.panel_message_id, _panel_embed(sc, resources, error=error))
+        if has_basic_panel:
+            await self._edit_message(
+                sc.basic_panel_channel_id, sc.basic_panel_message_id, _basic_panel_embed(sc, resources, error=error)
+            )
 
     # ---------- button handlers ----------
     async def handle_power(self, interaction: discord.Interaction, guild_id: int, server_key: str, signal: str):
@@ -657,6 +732,42 @@ class PterodactylCog(commands.Cog):
     async def _ac_panel(self, interaction: discord.Interaction, current: str):
         return await self._ac_server(interaction, current)
 
+    @ptero.command(
+        name="basicpanel",
+        description="Post a simple Start-only panel non-admins (with the basic role) can use.",
+    )
+    @app_commands.describe(server="Server nickname (optional if you only have one registered)")
+    @app_commands.default_permissions(administrator=True)
+    async def ptero_basicpanel(self, interaction: discord.Interaction, server: Optional[str] = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cfg = await self.store.get_guild_config(interaction.guild_id)
+        if not cfg.basic_role_id:
+            return await interaction.followup.send(
+                "Set who's allowed first with `/ptero basicrole`, then post the panel.", ephemeral=True
+            )
+        sc = self._resolve_server(cfg, server)
+        client = self._client_for(cfg)
+        if not client:
+            return await interaction.followup.send("Run `/ptero setup` first.", ephemeral=True)
+        if not sc:
+            return await interaction.followup.send("Specify `server:` — you have more than one registered.", ephemeral=True)
+        key = next(k for k, v in cfg.servers.items() if v is sc)
+        try:
+            resources = await client.get_resources(sc.identifier)
+            embed = _basic_panel_embed(sc, resources)
+        except PteroAPIError as e:
+            embed = _basic_panel_embed(sc, None, error=str(e))
+        view = PteroBasicPanelView(self, interaction.guild_id, key)
+        message = await interaction.channel.send(embed=embed, view=view)
+        sc.basic_panel_channel_id = message.channel.id
+        sc.basic_panel_message_id = message.id
+        await self.store.set_guild_config(cfg)
+        await interaction.followup.send("✅ Basic panel posted.", ephemeral=True)
+
+    @ptero_basicpanel.autocomplete("server")
+    async def _ac_basicpanel(self, interaction: discord.Interaction, current: str):
+        return await self._ac_server(interaction, current)
+
     @ptero.command(name="status", description="Show current status for a server.")
     @app_commands.describe(server="Server nickname (optional if you only have one registered)")
     @app_commands.default_permissions(administrator=True)
@@ -710,6 +821,18 @@ class PterodactylCog(commands.Cog):
         cfg.alert_channel_id = channel.id
         await self.store.set_guild_config(cfg)
         await interaction.response.send_message(f"🔔 Alerts will post in {channel.mention}.", ephemeral=True)
+
+    @ptero.command(name="basicrole", description="Set which role can use the basic Start-only panel.")
+    @app_commands.describe(role="Role allowed to press Start on the basic panel (Administrators can always use it)")
+    @app_commands.default_permissions(administrator=True)
+    async def ptero_basicrole(self, interaction: discord.Interaction, role: discord.Role):
+        cfg = await self.store.get_guild_config(interaction.guild_id)
+        cfg.basic_role_id = role.id
+        await self.store.set_guild_config(cfg)
+        await interaction.response.send_message(
+            f"✅ {role.mention} can now press Start on the basic panel. Post it with `/ptero basicpanel`.",
+            ephemeral=True,
+        )
 
     @ptero.command(name="monitor", description="Enable/disable automatic monitoring, or tune its interval.")
     @app_commands.describe(enabled="Turn monitoring on/off", interval_seconds="How often to poll (default 60, min 30)")
