@@ -23,7 +23,6 @@ COGS = [
     "cogs.kutt",
     "cogs.moderation_cog",
     "cogs.pins",
-    "cogs.audio",
     "cogs.horserace",
     "cogs.slots",
     "cogs.roulette",

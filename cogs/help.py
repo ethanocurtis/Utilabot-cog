@@ -39,7 +39,6 @@ CATEGORY_META: Dict[str, Dict[str, str]] = {
     "Pins":          {"emoji": "📌", "label": "Pins",           "blurb": "Save and organize message links per channel."},
     "StickyCog":     {"emoji": "📍", "label": "Sticky Notes",   "blurb": "Auto-reposting sticky messages in a channel."},
     "KuttCog":       {"emoji": "🔗", "label": "Links",          "blurb": "Shorten URLs with your Kutt instance."},
-    "AudioSlash":    {"emoji": "🎵", "label": "Audio",          "blurb": "Play music from YouTube in a voice channel."},
     "Tickets":       {"emoji": "🎫", "label": "Tickets",        "blurb": "Support ticket panel and per-ticket management."},
     "Moderation":    {"emoji": "🛡️", "label": "Moderation",     "blurb": "Purge messages and manage auto-delete rules."},
     "AutoRole":      {"emoji": "🚪", "label": "Auto Role",      "blurb": "Automatically assign roles to new members."},
