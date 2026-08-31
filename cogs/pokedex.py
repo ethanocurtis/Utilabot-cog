@@ -48,6 +48,66 @@ STAT_LABELS = [
     ("spe", "Spe"),
 ]
 
+# Standard (Gen 6+) type effectiveness chart: attacker -> {defender: multiplier}.
+# Omitted pairs default to 1x. This is generic Pokémon ruleset, not Cobbleverse-
+# specific, so it's hardcoded rather than sourced from the wiki (which doesn't
+# document it -- see the "How the wiki covers this" note in the cog docstring).
+ALL_TYPES = [
+    "Normal", "Fire", "Water", "Electric", "Grass", "Ice", "Fighting", "Poison",
+    "Ground", "Flying", "Psychic", "Bug", "Rock", "Ghost", "Dragon", "Dark",
+    "Steel", "Fairy",
+]
+TYPE_CHART: Dict[str, Dict[str, float]] = {
+    "Normal": {"Rock": 0.5, "Ghost": 0, "Steel": 0.5},
+    "Fire": {"Fire": 0.5, "Water": 0.5, "Grass": 2, "Ice": 2, "Bug": 2, "Rock": 0.5, "Dragon": 0.5, "Steel": 2},
+    "Water": {"Fire": 2, "Water": 0.5, "Grass": 0.5, "Ground": 2, "Rock": 2, "Dragon": 0.5},
+    "Electric": {"Water": 2, "Electric": 0.5, "Grass": 0.5, "Ground": 0, "Flying": 2, "Dragon": 0.5},
+    "Grass": {"Fire": 0.5, "Water": 2, "Grass": 0.5, "Poison": 0.5, "Ground": 2, "Flying": 0.5, "Bug": 0.5, "Rock": 2, "Dragon": 0.5, "Steel": 0.5},
+    "Ice": {"Fire": 0.5, "Water": 0.5, "Grass": 2, "Ice": 0.5, "Ground": 2, "Flying": 2, "Dragon": 2, "Steel": 0.5},
+    "Fighting": {"Normal": 2, "Ice": 2, "Poison": 0.5, "Flying": 0.5, "Psychic": 0.5, "Bug": 0.5, "Rock": 2, "Ghost": 0, "Dark": 2, "Steel": 2, "Fairy": 0.5},
+    "Poison": {"Grass": 2, "Poison": 0.5, "Ground": 0.5, "Rock": 0.5, "Ghost": 0.5, "Steel": 0, "Fairy": 2},
+    "Ground": {"Fire": 2, "Electric": 2, "Grass": 0.5, "Poison": 2, "Flying": 0, "Bug": 0.5, "Rock": 2, "Steel": 2},
+    "Flying": {"Electric": 0.5, "Grass": 2, "Fighting": 2, "Bug": 2, "Rock": 0.5, "Steel": 0.5},
+    "Psychic": {"Fighting": 2, "Poison": 2, "Psychic": 0.5, "Dark": 0, "Steel": 0.5},
+    "Bug": {"Fire": 0.5, "Grass": 2, "Fighting": 0.5, "Poison": 0.5, "Flying": 0.5, "Psychic": 2, "Ghost": 0.5, "Dark": 2, "Steel": 0.5, "Fairy": 0.5},
+    "Rock": {"Fire": 2, "Ice": 2, "Fighting": 0.5, "Ground": 0.5, "Flying": 2, "Bug": 2, "Steel": 0.5},
+    "Ghost": {"Normal": 0, "Psychic": 2, "Ghost": 2, "Dark": 0.5},
+    "Dragon": {"Dragon": 2, "Steel": 0.5, "Fairy": 0},
+    "Dark": {"Fighting": 0.5, "Psychic": 2, "Ghost": 2, "Dark": 0.5, "Fairy": 0.5},
+    "Steel": {"Fire": 0.5, "Water": 0.5, "Electric": 0.5, "Ice": 2, "Rock": 2, "Steel": 0.5, "Fairy": 2},
+    "Fairy": {"Fire": 0.5, "Fighting": 2, "Poison": 0.5, "Dragon": 2, "Dark": 2, "Steel": 0.5},
+}
+
+
+def _type_matchups(defender_types: List[str]) -> Dict[str, float]:
+    """Multiplier each attacking type deals against this type combo."""
+    out = {}
+    for atk in ALL_TYPES:
+        mult = 1.0
+        for d in defender_types:
+            mult *= TYPE_CHART.get(atk, {}).get(d, 1.0)
+        out[atk] = mult
+    return out
+
+
+def _format_matchups(mults: Dict[str, float]) -> str:
+    tiers = {4.0: [], 2.0: [], 0.5: [], 0.25: [], 0.0: []}
+    for atk, mult in mults.items():
+        if mult in tiers:
+            tiers[mult].append(atk)
+    lines = []
+    if tiers[4.0]:
+        lines.append(f"💥 **Weak x4:** {', '.join(tiers[4.0])}")
+    if tiers[2.0]:
+        lines.append(f"⚠️ **Weak x2:** {', '.join(tiers[2.0])}")
+    if tiers[0.5]:
+        lines.append(f"🛡️ **Resists x0.5:** {', '.join(tiers[0.5])}")
+    if tiers[0.25]:
+        lines.append(f"🛡️ **Resists x0.25:** {', '.join(tiers[0.25])}")
+    if tiers[0.0]:
+        lines.append(f"🚫 **Immune:** {', '.join(tiers[0.0])}")
+    return "\n".join(lines) if lines else "Neutral to all types."
+
 TYPE_COLORS = {
     "Normal": 0xA8A878, "Fire": 0xF08030, "Water": 0x6890F0, "Electric": 0xF8D030,
     "Grass": 0x78C850, "Ice": 0x98D8D8, "Fighting": 0xC03028, "Poison": 0xA040A0,
@@ -171,6 +231,10 @@ class Pokedex(commands.Cog):
                 f"{a['name']} *(hidden)*" if a.get("hidden") else a["name"] for a in abilities
             ]
             embed.add_field(name="Abilities", value="\n".join(ability_lines), inline=False)
+
+        if types:
+            matchup_text = _format_matchups(_type_matchups(types))
+            embed.add_field(name="Type Matchups", value=_truncate(matchup_text, 1024), inline=False)
 
         evolution = entry.get("evolution")
         if evolution:
