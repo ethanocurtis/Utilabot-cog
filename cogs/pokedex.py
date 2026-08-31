@@ -118,6 +118,13 @@ TYPE_COLORS = {
 DEFAULT_COLOR = 0x3B4CCA
 
 
+def _stat_bar(value: int, width: int = 9, scale: int = 200) -> str:
+    """Tiny block-character bar, scaled against a 200 reference point
+    (comfortably above most base stats, without every bar maxing out)."""
+    filled = max(0, min(width, round((value or 0) / scale * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -210,6 +217,7 @@ class Pokedex(commands.Cog):
         embed = discord.Embed(title=title, description=description, color=color)
         embed.set_thumbnail(url=SPRITE_BASE_URL + entry["sprite"])
 
+        # Row 1: three short facts side by side.
         embed.add_field(name="Type", value=" / ".join(types) or "Unknown", inline=True)
         h = entry.get("height_m")
         w = entry.get("weight_kg")
@@ -218,27 +226,32 @@ class Pokedex(commands.Cog):
             value=(f"{h} m · {w} kg" if h is not None and w is not None else "Unknown"),
             inline=True,
         )
-
-        stats = entry.get("base_stats")
-        if stats:
-            lines = [f"{label:<4} {stats.get(key, '-'):>3}" for key, label in STAT_LABELS]
-            lines.append(f"{'Tot':<4} {stats.get('total', '-'):>3}")
-            embed.add_field(name="Base Stats", value="```\n" + "\n".join(lines) + "\n```", inline=True)
-
         abilities = entry.get("abilities") or []
         if abilities:
             ability_lines = [
                 f"{a['name']} *(hidden)*" if a.get("hidden") else a["name"] for a in abilities
             ]
-            embed.add_field(name="Abilities", value="\n".join(ability_lines), inline=False)
+            embed.add_field(name="Abilities", value="\n".join(ability_lines), inline=True)
 
+        # Row 2: base stats get the full width so the bars have room.
+        stats = entry.get("base_stats")
+        if stats:
+            lines = [
+                f"{label:<4}{stats.get(key, 0):>4} {_stat_bar(stats.get(key, 0))}"
+                for key, label in STAT_LABELS
+            ]
+            lines.append(f"{'Tot':<4}{stats.get('total', 0):>4}")
+            embed.add_field(name="Base Stats", value="```\n" + "\n".join(lines) + "\n```", inline=False)
+
+        # Row 3: type matchups, full width.
         if types:
             matchup_text = _format_matchups(_type_matchups(types))
             embed.add_field(name="Type Matchups", value=_truncate(matchup_text, 1024), inline=False)
 
+        # Row 4: evolution, short — inline so it doesn't force an almost-empty row.
         evolution = entry.get("evolution")
         if evolution:
-            embed.add_field(name="Evolution", value=_truncate(evolution, 1024), inline=False)
+            embed.add_field(name="Evolution", value=_truncate(evolution, 1024), inline=True)
 
         embed.add_field(name="How to obtain in Cobbleverse", value=self._obtain_text(entry), inline=False)
 
@@ -295,8 +308,18 @@ class Pokedex(commands.Cog):
         if len(wild_spawns) > 3:
             lines.append(f"…and {len(wild_spawns) - 3} more spawn location(s).")
 
-        for note in (entry.get("other_notes") or [])[:2]:
+        # Skip notes that just restate the Evolution field or a radar already
+        # named in the legendary_quest summary above -- keep this section
+        # focused on obtain methods, not a catch-all for every admonition.
+        skip_prefixes = ("Evolution:", "Tracker")
+        shown_notes = 0
+        for note in entry.get("other_notes") or []:
+            if note.startswith(skip_prefixes):
+                continue
             lines.append(f"ℹ️ {note}")
+            shown_notes += 1
+            if shown_notes >= 2:
+                break
 
         if not lines:
             lines.append(
