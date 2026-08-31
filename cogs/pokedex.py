@@ -9,9 +9,14 @@ legendary/mythical quest chain -- gating item, radar, prerequisite).
 Data comes from a one-time build (scripts/build_cobbleverse_pokedex.py)
 against the community-maintained cazuike/cobbleverse-wiki repo, which is
 itself generated from the modpack's own config/spawn/datapack files. Re-run
-that script and commit the refreshed data/cobbleverse_pokedex.json when the
-wiki (or the pack) gets updated -- this cog does no network calls at
+that script and commit the refreshed assets/cobbleverse_pokedex.json when
+the wiki (or the pack) gets updated -- this cog does no network calls at
 lookup time.
+
+The dataset lives under assets/, not data/, on purpose: docker-compose
+bind-mounts a host directory over /app/data for runtime state (bot.db,
+minecraft config, etc.), which would shadow anything shipped there in
+the image. assets/ isn't mounted, so it survives.
 """
 
 from __future__ import annotations
@@ -28,7 +33,9 @@ from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-DATA_PATH = os.path.join("data", "cobbleverse_pokedex.json")
+# Resolved relative to this file (not the process CWD) so it's found
+# regardless of where the bot is launched from.
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "cobbleverse_pokedex.json")
 SPRITE_BASE_URL = "https://raw.githubusercontent.com/cazuike/cobbleverse-wiki/main/docs/assets/pokemon/"
 WIKI_SOURCE_URL = "https://github.com/cazuike/cobbleverse-wiki"
 

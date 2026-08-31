@@ -1,4 +1,4 @@
-"""Builds data/cobbleverse_pokedex.json from a local checkout of the
+"""Builds assets/cobbleverse_pokedex.json from a local checkout of the
 cazuike/cobbleverse-wiki repo (https://github.com/cazuike/cobbleverse-wiki).
 
 That wiki is generated from the actual Cobbleverse modpack files (spawn
@@ -10,7 +10,7 @@ Usage:
     python scripts/build_cobbleverse_pokedex.py /tmp/cobbleverse-wiki
 
 Re-run this whenever the wiki repo gets new commits to refresh
-data/cobbleverse_pokedex.json.
+assets/cobbleverse_pokedex.json.
 """
 
 from __future__ import annotations
@@ -327,7 +327,7 @@ def main() -> int:
         "-o",
         "--out",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "data" / "cobbleverse_pokedex.json",
+        default=Path(__file__).resolve().parent.parent / "assets" / "cobbleverse_pokedex.json",
     )
     args = ap.parse_args()
 
