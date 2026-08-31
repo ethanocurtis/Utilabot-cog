@@ -33,6 +33,7 @@ COGS = [
     "cogs.tickets",
     "cogs.minecraft",
     "cogs.mc_todo",
+    "cogs.pokedex",
     "cogs.stickynotes",
     "cogs.server_alerts",
     "cogs.auto_role",
